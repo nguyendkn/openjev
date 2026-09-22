@@ -112,6 +112,19 @@ performance-tuning loop.** New gap G17 (Laya server binds 0.0.0.0 without auth, 
 this-round scope; cheap mitigation (local firewall rule restricting :8090 to localhost) worth
 folding into Loop 6 if trivial.
 
+| 6 | delivered | loop-06-dev-doc.md | (bench harness, n_threads tuning proven, G17 mitigated) | loop-06-evidence.md | G18 new, G17 closed | 0 |
+
+**DoD status after Loop 6: ALL 6 ITEMS MET**, each independently re-verified by Runtime.check
+and/or QA (not self-report): server live, health 200, bench-via-curl valid for all methods, all
+3 LLM + Laya benchmarked, ≥1 real tuning iteration with before/after data (n_threads=28 beats
+16 and 32 across all 3 models, 90 real requests), no-auth preserved. G17 (security exposure)
+closed with a verified-working mitigation. Literal DoD bar cleared. Given the user's broader
+"tối ưu hoá liên tục... performance cao nhất" (continuous optimization, highest performance)
+framing, Runtime decision: run ONE more loop (7) testing batch_size + build-flags (the
+variables Loop 6 itself flagged as untested) for a more thorough optimization pass, then wrap
+with a final report — diminishing-returns judgment call, not an indefinite loop, since the
+literal "≥1 iteration" bar and all other DoD items are already met with real evidence.
+
 **DoD status after Loop 4**: items 1-3 MET (server, health, bench-via-curl). Item 4: 3/4 models
 done (Qwen3-0.6B, MiniCPM5-2B, Qwen3-4B all verified via external curl + CLI) — only Laya
 remains. Item 5 (tuning loop) and item 6 (no-auth, trivially true) untouched. Found+fixed 2 real

@@ -63,9 +63,13 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new() -> Self {
+    /// `n_threads` is threaded through to every `EngineConfig` this server's dedicated engine
+    /// worker loads (Loop 6: was previously hardcoded to `EngineConfig::default()`, making
+    /// `n_threads` tuning require a recompile; now a real startup-time value, see
+    /// `main.rs`'s `--threads` flag).
+    pub fn new(n_threads: i32) -> Self {
         let (tx, rx) = mpsc::channel::<WorkerJob>(32);
-        std::thread::spawn(move || supervisor_loop(rx));
+        std::thread::spawn(move || supervisor_loop(rx, n_threads));
         Self { tx }
     }
 }
@@ -103,10 +107,10 @@ impl AppState {
 /// resolves to `Err`, which it already maps to `ApiError::Internal("engine worker thread
 /// dropped the response")` (HTTP 500) — no code change needed there, this was already
 /// correct given how `oneshot` channels signal a dropped sender.
-fn supervisor_loop(mut rx: mpsc::Receiver<WorkerJob>) {
+fn supervisor_loop(mut rx: mpsc::Receiver<WorkerJob>, n_threads: i32) {
     loop {
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            worker_loop(&mut rx)
+            worker_loop(&mut rx, n_threads)
         }));
         match outcome {
             Ok(()) => return, // rx closed normally (all Senders/AppState clones dropped)
@@ -136,17 +140,17 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 
 /// One worker-thread lifetime's worth of job processing, from an empty model cache until the
 /// channel closes or a panic unwinds out of here (see `supervisor_loop`).
-fn worker_loop(rx: &mut mpsc::Receiver<WorkerJob>) {
+fn worker_loop(rx: &mut mpsc::Receiver<WorkerJob>, n_threads: i32) {
     let mut engines: HashMap<String, Engine> = HashMap::new();
     while let Some(job) = rx.blocking_recv() {
-        let result = run_bench(&mut engines, job.req);
+        let result = run_bench(&mut engines, job.req, n_threads);
         let _ = job.resp.send(result);
     }
 }
 
 impl Default for AppState {
     fn default() -> Self {
-        Self::new()
+        Self::new(EngineConfig::default().n_threads)
     }
 }
 
@@ -208,7 +212,11 @@ async fn health() -> StatusCode {
 /// worker's local, thread-confined model cache), ensuring the model is loaded+cached first.
 /// Pure blocking work — only ever called on the dedicated engine-worker thread, never inline in
 /// an async handler (see `AppState` doc comment for why this replaces `spawn_blocking` here).
-fn run_bench(engines: &mut HashMap<String, Engine>, req: BenchRequest) -> Result<BenchReport, ApiError> {
+fn run_bench(
+    engines: &mut HashMap<String, Engine>,
+    req: BenchRequest,
+    n_threads: i32,
+) -> Result<BenchReport, ApiError> {
     if req.options.is_empty() {
         return Err(ApiError::InvalidOptions(
             "options must list at least one option, e.g. [\"A\",\"B\"]".to_string(),
@@ -221,7 +229,11 @@ fn run_bench(engines: &mut HashMap<String, Engine>, req: BenchRequest) -> Result
         let t0 = Instant::now();
         let entry = models::find(&req.model)?;
         let model_path = models::ensure_downloaded(entry)?;
-        let mut engine = Engine::load(&model_path, EngineConfig::default())?;
+        let engine_config = EngineConfig {
+            n_threads,
+            ..EngineConfig::default()
+        };
+        let mut engine = Engine::load(&model_path, engine_config)?;
         timings.model_load_ms = t0.elapsed().as_millis();
 
         // Warmup, same as apps/cli: one throwaway decode + reset so it isn't baked into

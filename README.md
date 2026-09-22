@@ -61,8 +61,15 @@ See `Makefile` for additional targets (`fmt`, `clippy`, `ci` suite).
 
 `apps/server`/`apps/cli`'s Laya scoring method calls a **second, separately-running process**:
 the `laya` binary (built from `examples/laya` in the `ggmlc` repo — NOT the generic `ggmlc-run`
-runner) started as `laya serve <model.gguf> --port 8090 --device cpu`, bound to `127.0.0.1:8090`
-(no external exposure needed — only `openjev-cli`/`openjev-server` on the same host call it).
+runner) started as `laya serve <model.gguf> --port 8090 --device cpu`. **Correction (Loop 6,
+G17):** the `laya` binary itself has no `--host`/`--bind` flag (confirmed via `laya help`'s
+SERVE section) and actually binds `0.0.0.0:8090`, not `127.0.0.1:8090` — it cannot be made to
+bind loopback-only from its own CLI. On the target server this is mitigated with a host-level
+`iptables` rule (`-p tcp --dport 8090 -i lo -j ACCEPT` then `-p tcp --dport 8090 -j DROP`,
+loopback-only allow-then-drop) added in Loop 6, verified to keep `127.0.0.1:8090` reachable while
+external connections to `:8090` are dropped; only `openjev-cli`/`openjev-server` on the same host
+can reach it. This `iptables` rule is NOT persisted across a reboot (no `iptables-persistent` /
+netfilter-persistent installed) — re-apply it after any server reboot, or install persistence.
 The GGUF is loaded once at `laya serve` startup and kept warm; `crates/models::laya` is a
 blocking HTTP client (`reqwest`) POSTing to `http://127.0.0.1:8090/v1/decide` per request, not a
 per-request shell-out.
@@ -72,7 +79,8 @@ On the target Linux server there are therefore **two long-running processes** to
 - `laya serve` (port 8090, localhost-only) — started via `setsid nohup <path-to-laya-binary> serve <path-to-laya.gguf> --port 8090 --device cpu >logs/laya-serve.log 2>&1 & disown`.
 
 Check status: `curl http://127.0.0.1/health` (server) and `curl http://127.0.0.1:8090/health`
-(laya serve, from the server itself — not externally reachable by design). Restart either
+(laya serve, from the server itself — externally blocked by the Loop 6 `iptables` rule above,
+not by any binding behavior of the `laya` binary). Restart either
 independently by killing its PID (`ps aux | grep openjev-server` / `ps aux | grep 'laya serve'`)
 and re-running its start command above; `apps/server` degrades gracefully (`laya: null` in every
 `BenchReport`, no request failure) whenever `laya serve` is down, and self-heals on `laya
