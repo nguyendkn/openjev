@@ -1,5 +1,4 @@
 use serde::Serialize;
-use std::time::Instant;
 
 #[derive(Serialize, Clone, Copy, Debug)]
 pub struct Timings {
