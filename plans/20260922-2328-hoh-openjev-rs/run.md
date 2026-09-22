@@ -86,9 +86,13 @@ here so it isn't lost; likely Loop 5-6 after all 3 methods + 4 models work on th
 |------|--------|-----|-----|-----|------|-------------|
 | 1 | delivered | loop-01-dev-doc.md | (workspace + remote server, commit e098942) | loop-01-evidence.md | 8 | 0 |
 | 2 | delivered | loop-02-dev-doc.md | (workspace + remote server, real engine/models/pipeline, Qwen3-0.6B e2e via CLI) | loop-02-evidence.md | 3 new (G9/G10/G11), G3/G4/G5 closed | 0 |
-| 3 | delivered | loop-03-dev-doc.md | (apps/server live on 103.146.166.46:80, curl-verified externally, commit pending) | loop-03-evidence.md | 3 new (G12/G13/G14), 0 closed | 0 |
+| 3 | delivered | loop-03-dev-doc.md | (apps/server live on 103.146.166.46:80, curl-verified externally, commit ba0155b) | loop-03-evidence.md | 3 new (G12/G13/G14), 0 closed | 0 |
+| 4 | delivered | loop-04-dev-doc.md | (all 3 LLM models live via CLI+HTTP, shared_backend fix, G13 respawn-supervisor proven) | loop-04-evidence.md | 2 new (G15/G16), G9/G13 closed | 0 |
 
-**DoD status after Loop 3**: items 1-3 (server running, `/health` 200, `/bench` valid via curl on
-the real IP) — MET, independently re-verified by Runtime.check. Items 4-6 (all 4 models incl.
-Laya benchmarked, tuning loop, no-auth) — item 6 already true by default (no auth added);
-items 4-5 remain open, next loops.
+**DoD status after Loop 4**: items 1-3 MET (server, health, bench-via-curl). Item 4: 3/4 models
+done (Qwen3-0.6B, MiniCPM5-2B, Qwen3-4B all verified via external curl + CLI) — only Laya
+remains. Item 5 (tuning loop) and item 6 (no-auth, trivially true) untouched. Found+fixed 2 real
+bugs beyond D_4's literal scope: `BackendAlreadyInitialized` (blocked multi-model caching in one
+process entirely — `shared_backend()`/`OnceLock` fix) and G13 SPOF (respawn-supervisor, proven
+via real fault injection: ~85-124ms failure response, ~2.8s self-heal, empirically verified
+twice independently — by Developer and again by QA).

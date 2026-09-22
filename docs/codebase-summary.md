@@ -1,6 +1,6 @@
 # OpenJev-rs Codebase Summary
 
-Rust port of OpenJev/SemIf (CPU-only LLM benchmark: constrained-readout vs generation). **Phase 0 stage** — skeleton only, no business logic. See `docs/research/openjev-rust-research.md` for reference architecture.
+Rust port of OpenJev/SemIf (CPU-only LLM benchmark: constrained-readout vs generation). **Loop 4 (HoH) stage** — `engine`/`models`/`pipeline`/`apps/cli`/`apps/server` are all implemented and running real inference (not stubs); 3 of 4 registered LLM models (`qwen3-0.6b`, `minicpm5-2b`, `qwen3-4b`) verified end-to-end via both `apps/cli` and a live external `apps/server` on `103.146.166.46:80` (`laya` model + Laya scoring path remain unimplemented, tracked for Loop 5+). See `docs/research/openjev-rust-research.md` for reference architecture and `plans/20260922-2328-hoh-openjev-rs/loops/` for the current HoH loop history (source of truth for what changed since Phase 0).
 
 ---
 
@@ -39,54 +39,54 @@ openjev/
 | Dependencies | `serde` 1.0 (derive only) |
 | Status | Complete; lowest-level shared type, 0 intra-workspace deps |
 
-### `crates/models` — **STUB**
+### `crates/models` — **IMPLEMENTED**
 | Aspect | Details |
 |--------|---------|
-| Files | `lib.rs`, `download.rs`, `laya.rs`, `error.rs` (all stubs, 1–2 lines each) |
+| Files | `lib.rs`, `download.rs`, `laya.rs`, `error.rs` |
 | Modules Declared | `download`, `laya`, `error` |
-| Purpose | Model registry (4 entries: Qwen3-0.6B, MiniCPM-2B, Qwen3-4B, Laya-en), hf-hub download wrapper, ggmlc-run shell-out for Laya scoring |
+| Purpose | Model registry (`REGISTRY`, 4 entries, exact ids: `qwen3-0.6b`, `qwen3-4b`, `minicpm5-2b`, `laya`), `hf-hub`-backed cache-aware download (`ensure_downloaded`), `find(id)` lookup |
 | Dependencies | `hf-hub` 1.0, `serde` 1.0 |
 | Deps Within Workspace | None |
-| Status | Interface planned; no code yet |
+| Status | 3 of 4 entries (`qwen3-0.6b`, `qwen3-4b`, `minicpm5-2b`) downloaded, cached, and exercised end-to-end (Loops 1-4). `laya` entry has real registry data but the Laya scoring path (`laya.rs`, `ggmlc-run` wrapper) is unimplemented — Loop 5+. |
 
-### `crates/engine` — **STUB**
+### `crates/engine` — **IMPLEMENTED**
 | Aspect | Details |
 |--------|---------|
-| Files | `lib.rs` (1 line: `pub mod error;`), `error.rs` (1 line comment) |
-| Purpose | GGUF loader via `llama-cpp-2`, LlamaContext wrapper, logits/KV-cache APIs |
+| Files | `lib.rs`, `error.rs` |
+| Purpose | GGUF loader via `llama-cpp-2` (`Engine::load`), tokenize/chat-template/decode/sample/reset-KV-cache API, process-wide shared `LlamaBackend` singleton (`shared_backend()`, Loop 4 fix — `llama-cpp-2`'s `LlamaBackend::init()` can only succeed once per process while any prior instance is alive, which broke multi-model caching until fixed) |
 | Dependencies | `llama-cpp-2` 0.1, `models`, `timing` |
 | Deps Within Workspace | `models`, `timing` |
-| Status | Interface & research verified (Phase 0); implementation deferred to Phase 1 |
+| Status | Implemented and verified against 3 real GGUF models (CPU-only, quantized). Uses `unsafe` lifetime-widening for a self-referential `Engine` (heap-boxed `LlamaModel` + `LlamaContext<'static>` borrowing from it) — documented in the struct's doc comment. |
 
-### `crates/pipeline` — **STUB**
+### `crates/pipeline` — **IMPLEMENTED**
 | Aspect | Details |
 |--------|---------|
-| Files | `lib.rs` (4 lines: module decls), plus `readout.rs`, `generate.rs`, `laya.rs`, `error.rs` (all stubs) |
+| Files | `lib.rs`, `readout.rs`, `generate.rs`, `laya.rs` (stub), `error.rs` |
 | Modules Declared | `readout`, `generate`, `laya`, `error` |
-| Purpose | 3 pipelines: constrained single-token readout (Phase 2), greedy generation (Phase 3), Laya scoring (Phase 3) |
+| Purpose | Constrained single-token readout (`run_readout`, softmax restricted to option-label token ids) and greedy generation (`run_generate`) both implemented and used by `apps/cli`/`apps/server`; `laya` (external `ggmlc-run` scoring) still a stub |
 | Dependencies | `engine`, `models`, `timing` |
 | Deps Within Workspace | `engine`, `models`, `timing` |
-| Status | Interface & test scenarios planned; no implementation yet |
+| Status | `readout`/`generate` implemented, unit-tested (3 tests in `readout.rs`), and verified against 3 real models. `laya.rs` unimplemented (Loop 5+; G10 — `generate.rs` has no committed unit tests — tracked, non-blocking). |
 
-### `apps/cli` — **STUB**
+### `apps/cli` — **IMPLEMENTED**
 | Aspect | Details |
 |--------|---------|
-| Files | `src/main.rs` (1 line: println stub), `Cargo.toml` (package + bin name + deps) |
+| Files | `src/main.rs`, `Cargo.toml` |
 | Binary Name | `openjev-cli` |
-| Purpose | One-shot benchmark runner; CLI args via clap derive |
+| Purpose | One-shot benchmark runner (`--model --prompt --options --format json`); loads a registry model, runs readout+generate, prints `BenchReport`-shaped JSON |
 | Dependencies | `clap` 4.4 (derive), `serde` 1.0, `serde_json` 1.0, + all core crates |
 | Deps Within Workspace | `engine`, `models`, `pipeline`, `timing` |
-| Status | Skeleton only; subcommand enum & main loop in Phase 4 (phase-04-cli-bench.md) |
+| Status | Implemented and verified for `qwen3-0.6b`, `qwen3-4b`, `minicpm5-2b` on the Linux server (real GGUF inference, valid JSON, correct sanity-prompt answers). |
 
-### `apps/server` — **STUB**
+### `apps/server` — **IMPLEMENTED**
 | Aspect | Details |
 |--------|---------|
-| Files | `src/main.rs` (1 line: println stub), `Cargo.toml` (package + bin name + deps) |
+| Files | `src/main.rs`, `src/app.rs` |
 | Binary Name | `openjev-server` |
-| Purpose | axum HTTP API server; `POST /bench`, `GET /health` endpoints |
+| Purpose | axum HTTP API; `POST /bench` (lazy-load + per-model `Engine` cache), `GET /health`. `Engine` is `!Send` (FFI raw pointers), so model caching is confined to one dedicated OS thread reached via `mpsc`/`oneshot` channels from the async handler (not `spawn_blocking` — documented pivot, see `AppState` doc comment in `app.rs`). Worker thread is panic-supervised (Loop 4, G13 fix): a `catch_unwind`-wrapped supervisor respawns the worker with a fresh, empty model cache on any panic instead of leaving the channel permanently dead. |
 | Dependencies | `clap` 4.4 (derive), `axum` 0.7, `tokio` 1.0 (full features), `serde` 1.0, `serde_json` 1.0, + all core crates |
 | Deps Within Workspace | `engine`, `models`, `pipeline`, `timing` |
-| Status | Skeleton only; route handlers & `tokio::task::spawn_blocking` pattern in Phase 5 (phase-05-http-api-serve.md) |
+| Status | Implemented and running live on `103.146.166.46:80` (root, no auth — accepted risk, see G14 below), externally curl-verified for all 3 exercised models, concurrency, invalid-model 4xx, and panic-recovery. G12 (no committed unit tests for `app.rs`/`main.rs`) tracked, non-blocking — all validation is black-box HTTP-level and passes. |
 
 ---
 
@@ -200,39 +200,42 @@ make ci
 
 ## What's NOT Implemented Yet
 
+Original Phase 0-7 plan (`plans/20260922-2146-openjev-rust-implementation/`) was superseded by the HoH loop process (`plans/20260922-2328-hoh-openjev-rs/`) partway through — Phases 1-5 below are done, tracked instead as closed via that loop history, not this table.
+
 | Phase | Scope | Target File(s) | Status |
 |-------|-------|-----------------|--------|
-| **Phase 0** | Spike verification (model paths, API shapes) | — | In progress (validation round 1 complete; 2 BLOCKERs + 4 MINORs flagged) |
-| **Phase 1** | Engine: GGUF load, tokenize, logits, KV-cache, warmup | `crates/engine/lib.rs` | Planning (depends: Phase 0 facts) |
-| **Phase 2** | Pipeline: constrained-readout (single-token softmax over options) | `crates/pipeline/readout.rs` | Planned (depends: Phase 1) |
-| **Phase 3** | Pipeline: generation (greedy, max 512 tokens, strip `<think>...</think>`) | `crates/pipeline/generate.rs` | Planned (depends: Phase 1) |
-| **Phase 4** | CLI: bench subcommand, run both pipelines, JSON output | `apps/cli/src/main.rs` | Planned (depends: Phase 2, 3) |
-| **Phase 5** | HTTP API: `POST /bench`, `GET /health`, spawn_blocking inference | `apps/server/src/main.rs` | Planned (depends: Phase 2, 3) |
-| **Phase 6** | Tests: unit + integration (real model), coverage ≥90% line / ≥75% branch | `tests/` (new) | Planned (depends: Phase 1–5) |
-| **Phase 7** | E2E server tuning, deployment automation | — | Deferred |
+| **Phase 1** | Engine: GGUF load, tokenize, logits, KV-cache, warmup | `crates/engine/lib.rs` | **Done** (Loop 1-2) |
+| **Phase 2** | Pipeline: constrained-readout (single-token softmax over options) | `crates/pipeline/readout.rs` | **Done** (Loop 2) |
+| **Phase 3** | Pipeline: generation (greedy, strip `<think>...</think>`) | `crates/pipeline/generate.rs` | **Done** (Loop 2) |
+| **Phase 4** | CLI: bench subcommand, run both pipelines, JSON output | `apps/cli/src/main.rs` | **Done** (Loop 2), re-verified for 3 models (Loop 4) |
+| **Phase 5** | HTTP API: `POST /bench`, `GET /health` | `apps/server/src/main.rs` | **Done** (Loop 3), panic-supervised worker + 3-model verification (Loop 4) |
+| **Phase 6** | Tests: unit + integration (real model), coverage | `tests/` (new) | Partial — 3 unit tests in `pipeline/readout.rs`; `generate.rs` (G10) and `apps/server` (G12) have no committed unit tests (black-box HTTP validation covers `apps/server` instead). Not blocking so far. |
+| **Phase 7** | E2E server tuning, deployment automation | — | Not started (Laya scoring, load/perf tuning — Loop 5+) |
 
-### Critical Unresolved Items (Phase 0)
-1. **Model repo IDs** — exact HF repo for "MiniCPM-2B" & "Qwen3-4B" (both UNVERIFIED / INFERRED from search)
-2. **hf-hub API shape** — exact download signature & model caching behavior (UNVERIFIED)
-3. **llama-cpp-2 logits API** — exact method names for `get_logits_ith` & KV-cache reset (Inferred, not confirmed)
-4. **llama-cpp-2 chat template** — whether `llama_chat_apply_template` is wrapped (UNVERIFIED; fallback: hand-rolled ChatML)
-5. **KV-cache reset between pipelines** — which method to call, when to call it (UNVERIFIED)
-
-All blocking items listed in `phase-00-spike-verification.md:28-79` must be closed before Phase 1 starts.
+### Critical Unresolved Items (Phase 0) — resolution status
+1. **Model repo IDs** — resolved. Exact registry (`crates/models/src/download.rs::REGISTRY`): `qwen3-0.6b`→`Qwen/Qwen3-0.6B-GGUF`, `qwen3-4b`→`Qwen/Qwen3-4B-GGUF`, `minicpm5-2b`→`openbmb/MiniCPM5-2B-GGUF` (note: `MiniCPM5`, not the originally-assumed `MiniCPM-2B`), `laya`→`mys/laya-GGUF`. All 4 pinned to a resolved commit SHA.
+2. **hf-hub API shape** — resolved. `HFClientSync::model(owner,name).download_file().filename(..).revision(..).send()`, cache-aware (no network request on a warm cache), confirmed via 3 real downloaded/reused models.
+3. **llama-cpp-2 logits API** — resolved. `ctx.get_logits_ith(i)` confirmed working against 3 real models.
+4. **llama-cpp-2 chat template** — resolved. `model.chat_template(None)` + `apply_chat_template` used when present; hand-rolled ChatML fallback otherwise. All 3 exercised models (Qwen3 family + MiniCPM5) use a ChatML-compatible template — the fallback path exists but hasn't been forced/observed on a model that actually lacks GGUF chat-template metadata.
+5. **KV-cache reset between pipelines** — resolved. `Engine::reset_context()` → `ctx.clear_kv_cache()`, called between readout/generate AND at the top of every `apps/server` request (cross-request isolation, Loop 3 fix).
 
 ---
 
 ## Known Issues
 
-**Validation Round 1 Findings:**
+Validation Round 1 (Phase 0 planning-time) findings below are historical/superseded — the plan structure they describe (`src/pipeline/mod.rs`, `src/cli/mod.rs`, Phase numbering) was replaced by the actual `crates/`+`apps/` workspace layout and the HoH loop process. Kept for history; see `plans/20260922-2146-openjev-rust-implementation/reports/` for the original detail.
 
-- **Structural BLOCKERs (2):** `src/pipeline/mod.rs` & `src/cli/mod.rs` written by parallel phases; contradicts plan.md "no overlap" claim (phase files themselves acknowledge coordination needed).
-- **Consistency BLOCKERs (2):**
-  - `Timings` type consumed by Phase 2/3 before it's defined (Phase 4 owns it).
-  - Phase 3 needs `Engine::sample_greedy()` that Phase 1 never declares.
-- **Testability BLOCKER (1):** Phase 0 declares "no tests" but is `lane: normal` (not exempted from quality gate).
+**Current known issues** (tracked in `plans/20260922-2328-hoh-openjev-rs/loops/issue-ledger.md`):
+- **G9** — this file and `docs/project-overview-pdr.md` were stale relative to code; Loop 4 refreshed both (this edit).
+- **G10** — `crates/pipeline/generate.rs` has no committed unit tests (black-box CLI/HTTP validation covers it instead).
+- **G12** — `apps/server/src/{app,main}.rs` has no committed unit tests (black-box HTTP validation covers it instead).
+- **G14** — `apps/server` binds port 80 (root, no auth) instead of an unprivileged port; accepted deviation, documented residual risk (root-bind, future reverse-proxy collision, more-probed port).
+- **Laya** — `crates/pipeline/laya.rs` and the `ggmlc-run` scoring wrapper in `crates/models` are unimplemented; `laya_model_load_ms`/`laya_inference_ms` are always `0` in every `Timings` observed so far. Loop 5+.
 
-See `plans/20260922-2146-openjev-rust-implementation/reports/` for full validation details.
+**Historical (Phase 0 planning-time) findings, superseded:**
+- Structural BLOCKERs (2): `src/pipeline/mod.rs` & `src/cli/mod.rs` written by parallel phases; contradicted the original plan.md "no overlap" claim — moot, actual layout is `crates/pipeline`, `apps/cli`.
+- Consistency BLOCKERs (2): `Timings` consumed before defined; `Engine::sample_greedy()` needed but undeclared — both resolved in the actual implementation (`Timings` lives in `crates/timing`, defined first; `Engine::sample_greedy` is implemented in `crates/engine/src/lib.rs`).
+- Testability BLOCKER (1): Phase 0 "no tests" — moot, Phase 0 itself has no surviving artifact; see G10/G12 above for the current, real test-coverage gaps.
 
 ---
 
@@ -240,14 +243,14 @@ See `plans/20260922-2146-openjev-rust-implementation/reports/` for full validati
 
 - **Workspace:** 6-crate, single-resolver
 - **Executables:** 2 (`openjev-cli`, `openjev-server`)
-- **Models Registry:** 4 hardcoded entries (Qwen3-0.6B Q8_0, MiniCPM-2B, Qwen3-4B, Laya-en)
-- **Benchmark Dimensions:** 7 timed phases (model-load, warmup, tokenize, constrained-readout, generation, laya-model-load, laya-inference)
-- **Inference Runtime:** llama.cpp via `llama-cpp-2` (CPU-only, quantized GGUF)
-- **Scoring:** External `ggmlc-run` CLI for Laya (no FFI)
-- **Code Maturity:** All stubs except `crates/timing` (27 lines) — Phase 0 architectural validation in progress
+- **Models Registry:** 4 hardcoded entries (`qwen3-0.6b`, `qwen3-4b`, `minicpm5-2b`, `laya`); first 3 downloaded, cached, and verified end-to-end via both binaries (Loop 4), `laya` registry data present but not exercised (no Laya scoring path yet)
+- **Benchmark Dimensions:** 7 timed phases (model-load, warmup, tokenize, constrained-readout, generation, laya-model-load, laya-inference) — the two `laya_*` fields are always `0` until Laya scoring is implemented
+- **Inference Runtime:** llama.cpp via `llama-cpp-2` (CPU-only, quantized GGUF), one process-wide shared `LlamaBackend` (Loop 4 fix enabling multi-model caching in one process)
+- **Scoring:** External `ggmlc-run` CLI for Laya (no FFI) — binary present on the server, wrapper unimplemented
+- **Code Maturity:** `engine`/`models`/`pipeline`/`apps/cli`/`apps/server` all implemented and running real inference; live externally-reachable server on `103.146.166.46:80`; remaining gaps are test coverage (G10/G12, non-blocking, black-box-covered) and Laya (Loop 5+)
 
 ---
 
-Last updated: 2026-09-22  
-Plan: `plans/20260922-2146-openjev-rust-implementation/plan.md`  
+Last updated: 2026-09-23 (Loop 4, HoH)
+Plan: `plans/20260922-2328-hoh-openjev-rs/` (current); `plans/20260922-2146-openjev-rust-implementation/plan.md` (original, superseded — see Known Issues)
 Research: `docs/research/openjev-rust-research.md`

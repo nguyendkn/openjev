@@ -1,8 +1,8 @@
 # OpenJev-rs Product/Design Requirements
 
-**Version:** 0.1 (Phase 0 baseline)  
-**Last updated:** 2026-09-22  
-**Status:** Pending Phase 0 (spike verification)
+**Version:** 0.1 (Phase 0 baseline; requirements below still reflect original v1 design intent)
+**Last updated:** 2026-09-23 (Loop 4, HoH — see status note)
+**Status:** Phase 0 spike items resolved; engine/models/pipeline/apps/cli/apps/server all implemented and running real inference for `qwen3-0.6b`, `qwen3-4b`, `minicpm5-2b` (both CLI and a live external HTTP server on `103.146.166.46:80`). Laya (item 3 of the 3-way comparison — encoder scoring via `ggmlc-run`) is NOT yet implemented; `laya_model_load_ms`/`laya_inference_ms` are always `0`. See `docs/codebase-summary.md` and `plans/20260922-2328-hoh-openjev-rs/loops/` for current, authoritative implementation status — this document's Functional Requirements/Acceptance Criteria/Open Risks sections below are the *original* v1 design targets and are only lightly annotated with resolution status, not rewritten.
 
 ## Problem Statement
 
@@ -83,6 +83,7 @@ openjev-cli \
 **Must-have:**
 - Singleton `Arc<Mutex<AppState>>` (inference is inherently sequential; one request at a time).
 - `tokio::task::spawn_blocking` around engine calls (llama-cpp-2 is not async-native).
+- **As-implemented deviation (Loop 3), same effective guarantee:** `Arc<Mutex<...>>` + `spawn_blocking` was not viable — `Engine` wraps raw `llama-cpp-2` FFI pointers and is `!Send`, which `spawn_blocking`'s `F: Send` bound rejects. Implemented instead as one dedicated OS thread owning `HashMap<String, Engine>`, reached via `mpsc`/`oneshot` channels from the async handler — still fully serializes inference, `Engine` never crosses a thread boundary. Loop 4 added panic supervision (G13): the worker thread is wrapped in a `catch_unwind` supervisor that respawns it with an empty model cache on any panic, so a single bad request can't permanently kill inference. See `apps/server/src/app.rs`'s `AppState`/`supervisor_loop` doc comments.
 - `GET /health` returns `{"status": "ok"}`.
 - Graceful error handling per method: a Laya failure does not abort readout/generation results (flag partial result).
 
@@ -148,16 +149,16 @@ openjev-cli \
 
 | # | Item | Current State | Fallback (if source ambiguous) | Verification Method |
 |---|---|---|---|---|
-| 1 | MiniCPM HF repo ID | `openbmb/MiniCPM4-2B(-GGUF)` unclear; only `MiniCPM5-2B-GGUF` + `MiniCPM4-8B` exist on HF | `openbmb/MiniCPM5-2B-GGUF` | Check OpenJev GitHub source (workszop/openjev, worker.js model config) for exact repo ID used; if ambiguous, use fallback + record reasoning |
-| 2 | Qwen "4B" HF repo ID | Both `Qwen3-4B-GGUF` + `Qwen3.5-4B-GGUF` exist on HF; unclear which original used | `Qwen/Qwen3-4B-GGUF` (matches 0.6B family) | Check OpenJev GitHub source; if ambiguous, use fallback + record reasoning |
-| 3 | hf-hub crate API | Version/builder shape unclear (HFClient vs Api vs older); conflicting default cache path | Resolve via `cargo add hf-hub --dry-run`, then read `cargo doc --open` or docs.rs for pinned version | Read docs.rs / local `cargo doc` against pinned version (do NOT code blind against summaries) |
-| 4 | llama-cpp-2 logits + KV-cache API | `get_logits_ith`, KV-cache reset, chat-template wrapper signatures unconfirmed | Hand-build ChatML prompts (Qwen3/MiniCPM both use `<\|im_start\|>role` framing) if no wrapper exists | Read `cargo doc --open` or `llama-cpp-2/src/context.rs` + `src/model.rs` source directly |
-| 5 | Model licensing | Apache-2.0 assumed, not verified per-repo on HF | Keep NOTICE file if Apache-2.0 confirmed; verify in Phase 0/1 before public distribution | Read HF license metadata field for each pinned repo |
-| 6 | ggmlc-run CLI syntax | Typed-decision scoring subcommand/flags unconfirmed (web search found `info`, `chat`, `run --image` but not scoring) | N/A (unguessable; must resolve) | Read `ggmlc-run --help` after building (see #7) or Laya model card's usage snippet on HF |
-| 7 | ggmlc-run Windows build | CMake/C++17 toolchain family same as llama-cpp-2 but never actually built/verified this session | N/A (same risk category as llama-cpp-2, not new) | Clone github.com/monatis/ggmlc, build on Windows dev machine, verify `ggmlc-run` binary runs |
-| 8 | Laya CPU latency | No public CPU data; only GPU (RTX 4050 ~25ms). Don't assume GPU speed on CPU | N/A (must measure) | Once #6/#7 resolved, run one quick sanity timing on a test system (not full Phase 7 tuning yet) to establish order-of-magnitude |
+| 1 | MiniCPM HF repo ID | **RESOLVED** — `openbmb/MiniCPM5-2B-GGUF`, file `MiniCPM5-2B-Q4_K_M.gguf`. Registry id is `minicpm5-2b` (not `minicpm-2b`) — matches the predicted fallback exactly. Downloaded, cached, verified via real inference (Loop 4). | `openbmb/MiniCPM5-2B-GGUF` | Check OpenJev GitHub source (workszop/openjev, worker.js model config) for exact repo ID used; if ambiguous, use fallback + record reasoning |
+| 2 | Qwen "4B" HF repo ID | **RESOLVED** — `Qwen/Qwen3-4B-GGUF`, file `Qwen3-4B-Q4_K_M.gguf`, registry id `qwen3-4b`. Matches the predicted fallback exactly. Downloaded, cached, verified via real inference (Loop 4). | `Qwen/Qwen3-4B-GGUF` (matches 0.6B family) | Check OpenJev GitHub source; if ambiguous, use fallback + record reasoning |
+| 3 | hf-hub crate API | **RESOLVED** — `hf-hub` 1.0, `HFClientSync::new().model(owner,name).download_file().filename(..).revision(..).send()`; cache-aware, confirmed via 4 real cached models (`crates/models/src/download.rs`). | Resolve via `cargo add hf-hub --dry-run`, then read `cargo doc --open` or docs.rs for pinned version | Read docs.rs / local `cargo doc` against pinned version (do NOT code blind against summaries) |
+| 4 | llama-cpp-2 logits + KV-cache API | **RESOLVED** — `ctx.get_logits_ith(i)`, `ctx.clear_kv_cache()`, `model.chat_template(None)` + `apply_chat_template` (ChatML fallback if absent) — all confirmed working against 3 real models (`crates/engine/src/lib.rs`). Loop 4 additionally discovered+fixed a process-wide `LlamaBackend::init()`-can-only-succeed-once constraint not anticipated here (see `docs/codebase-summary.md` `crates/engine` entry). | Hand-build ChatML prompts (Qwen3/MiniCPM both use `<\|im_start\|>role` framing) if no wrapper exists | Read `cargo doc --open` or `llama-cpp-2/src/context.rs` + `src/model.rs` source directly |
+| 5 | Model licensing | **RESOLVED** — all 4 registry entries report `apache-2.0` via HF's `cardData.license` field (`crates/models/src/download.rs` header comment). | Keep NOTICE file if Apache-2.0 confirmed; verify in Phase 0/1 before public distribution | Read HF license metadata field for each pinned repo |
+| 6 | ggmlc-run CLI syntax | Still open — `ggmlc-run` binary is built and present on the server (`/tmp/ggmlc/build/runtime/ggmlc-run`), but the scoring subcommand/flags are not wired into `crates/models::laya` yet. Loop 5+. | N/A (unguessable; must resolve) | Read `ggmlc-run --help` after building (see #7) or Laya model card's usage snippet on HF |
+| 7 | ggmlc-run Windows build | Not applicable to current scope — dev/build/run all happen on the Linux target server, not the Windows dev machine, for this project so far. | N/A (same risk category as llama-cpp-2, not new) | Clone github.com/monatis/ggmlc, build on Windows dev machine, verify `ggmlc-run` binary runs |
+| 8 | Laya CPU latency | Still open — not measured; blocked on #6 (Laya scoring path unimplemented). | N/A (must measure) | Once #6/#7 resolved, run one quick sanity timing on a test system (not full Phase 7 tuning yet) to establish order-of-magnitude |
 
-**Phase 0 exit criteria:** all 8 items resolved with evidence (no guessing). Record findings in spike notes; decision fallbacks already documented above.
+**Phase 0 exit criteria:** 5 of 8 items resolved with evidence (1-5, all LLM/inference-path items — no guessing was needed, registry ids matched the documented fallbacks exactly). Items 6-8 (all Laya-specific) remain open, tracked for Loop 5+, not blocking the LLM-only work done through Loop 4.
 
 ## Architecture
 

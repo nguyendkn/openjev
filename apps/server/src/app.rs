@@ -58,15 +58,83 @@ pub struct AppState {
 
 impl AppState {
     pub fn new() -> Self {
-        let (tx, mut rx) = mpsc::channel::<WorkerJob>(32);
-        std::thread::spawn(move || {
-            let mut engines: HashMap<String, Engine> = HashMap::new();
-            while let Some(job) = rx.blocking_recv() {
-                let result = run_bench(&mut engines, job.req);
-                let _ = job.resp.send(result);
-            }
-        });
+        let (tx, rx) = mpsc::channel::<WorkerJob>(32);
+        std::thread::spawn(move || supervisor_loop(rx));
         Self { tx }
+    }
+}
+
+/// G13 fix: owns the dedicated engine-worker thread's *outer* loop and recovers it from a
+/// panic instead of letting the thread (and the `mpsc::Receiver` it owns) die permanently.
+///
+/// Design choice — respawn-with-empty-cache, not per-job `catch_unwind` around a
+/// long-lived `HashMap<String, Engine>`: `Engine` (`crates/engine`) is a self-referential
+/// struct built with `unsafe` lifetime-widening (`LlamaContext<'static>` borrowing from a
+/// heap-boxed `LlamaModel` via `std::mem::transmute`), wrapping raw `llama-cpp-2`/FFI state.
+/// `std::panic::catch_unwind` only guarantees the *Rust* stack unwinds safely and no memory
+/// is freed twice/UB is triggered at the Rust level — it does NOT guarantee that whatever
+/// `Engine`'s FFI calls (`ctx.decode`, which crosses into llama.cpp's C layer and mutates
+/// its internal KV-cache/position bookkeeping) were doing at the moment of the panic left
+/// that FFI-side state in a form that's still correct to keep using. There is no documented
+/// `UnwindSafe`/panic-safety audit of `llama-cpp-2`'s internals to lean on here, and getting
+/// this wrong would fail silently (a corrupted `Engine` could keep answering requests with
+/// subtly wrong results instead of erroring), which is worse than the extra reload cost of
+/// respawning. So: `engines` is created fresh *inside* `worker_loop` on every (re)entry: if
+/// `worker_loop` panics, `catch_unwind` catches it here, the panicking stack frame's entire
+/// `engines: HashMap<String, Engine>` is dropped as part of unwinding (discarding every
+/// cached model, not just the implicated one), and the loop below immediately calls
+/// `worker_loop` again with a brand-new empty cache — self-healing within the same process,
+/// no operator restart needed, at the cost of one reload per model on next use. `rx` itself
+/// is untouched by the panic (it only ever produces `Some(job)`/`None` before `run_bench` is
+/// called, which is where a hypothetical panic would occur) and is safe to keep reusing
+/// across respawns; it is threaded through via `AssertUnwindSafe` since `&mut Receiver` is
+/// not `UnwindSafe` by default (that trait errs conservatively for any `&mut`, not because
+/// this specific type is actually at risk here).
+///
+/// The panicking request itself still gets a clean error, not a hang: its `WorkerJob::resp`
+/// (a `oneshot::Sender`) is a value local to the panicking `worker_loop` call and is dropped
+/// during unwinding without ever calling `.send(..)`; `bench_handler`'s `resp_rx.await` then
+/// resolves to `Err`, which it already maps to `ApiError::Internal("engine worker thread
+/// dropped the response")` (HTTP 500) — no code change needed there, this was already
+/// correct given how `oneshot` channels signal a dropped sender.
+fn supervisor_loop(mut rx: mpsc::Receiver<WorkerJob>) {
+    loop {
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            worker_loop(&mut rx)
+        }));
+        match outcome {
+            Ok(()) => return, // rx closed normally (all Senders/AppState clones dropped)
+            Err(payload) => {
+                let msg = panic_message(&payload);
+                eprintln!(
+                    "engine worker thread panicked, respawning with an empty model cache: {msg}"
+                );
+                // loop continues: worker_loop is called again with a fresh HashMap below.
+            }
+        }
+    }
+}
+
+/// Best-effort extraction of a panic's message for logging (`std::panic::PanicHookInfo`/the
+/// `catch_unwind` payload is `Box<dyn Any + Send>`; the two conventional payload shapes are
+/// `&str` for `panic!("literal")` and `String` for `panic!("{}", formatted)`).
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        s.to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "<non-string panic payload>".to_string()
+    }
+}
+
+/// One worker-thread lifetime's worth of job processing, from an empty model cache until the
+/// channel closes or a panic unwinds out of here (see `supervisor_loop`).
+fn worker_loop(rx: &mut mpsc::Receiver<WorkerJob>) {
+    let mut engines: HashMap<String, Engine> = HashMap::new();
+    while let Some(job) = rx.blocking_recv() {
+        let result = run_bench(&mut engines, job.req);
+        let _ = job.resp.send(result);
     }
 }
 

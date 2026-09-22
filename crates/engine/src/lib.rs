@@ -11,6 +11,34 @@ use llama_cpp_2::sampling::LlamaSampler;
 use llama_cpp_2::token::LlamaToken;
 use std::num::NonZeroU32;
 use std::path::Path;
+use std::sync::OnceLock;
+
+static BACKEND: OnceLock<LlamaBackend> = OnceLock::new();
+
+/// Returns the process-wide shared llama.cpp backend, initializing it on first call.
+/// `LlamaBackend::init()` is a process-global singleton (an internal `AtomicBool` in
+/// `llama-cpp-2` rejects a second `init()` call with `BackendAlreadyInitialized` while any
+/// previous `LlamaBackend` value returned by an earlier `init()` is still alive — see
+/// `llama-cpp-2`'s `llama_backend.rs`). `Engine::load` used to call `LlamaBackend::init()`
+/// once per `Engine` and store the result as an owned field; that works for a single cached
+/// model (`apps/cli`, one `Engine` per process) but breaks `apps/server`'s multi-model cache
+/// (`HashMap<String, Engine>`): loading a second, distinct model while the first model's
+/// `Engine` (and its `LlamaBackend`) is still alive in the cache fails here (reproduced via a
+/// real `POST /bench` for `minicpm5-2b` on a server process that had already cached
+/// `qwen3-0.6b`: `"llama backend init failed: BackendAlreadyInitialized"`). Sharing one
+/// `'static` backend across all `Engine`s (leaked for the process's lifetime — never freed
+/// until process exit, which is fine since the process keeps its model cache alive for its
+/// whole life anyway) fixes this. Not guarded against concurrent first-call races: the only
+/// two callers never call this concurrently (`apps/cli`: one `Engine`, one thread;
+/// `apps/server`: one dedicated worker thread processes jobs sequentially — see `AppState`'s
+/// doc comment in `apps/server/src/app.rs`).
+fn shared_backend() -> Result<&'static LlamaBackend, EngineError> {
+    if let Some(backend) = BACKEND.get() {
+        return Ok(backend);
+    }
+    let backend = LlamaBackend::init().map_err(|e| EngineError::BackendInit(e.to_string()))?;
+    Ok(BACKEND.get_or_init(|| backend))
+}
 
 /// Configuration for [`Engine::load`]. CPU-only: `llama-cpp-2` is used with its default
 /// feature set (no `cuda`/`vulkan`/`rocm`/`opencl` cargo features enabled — see
@@ -40,14 +68,16 @@ impl Default for EngineConfig {
 /// A loaded GGUF model plus a persistent inference context, backed by `llama-cpp-2`.
 ///
 /// `model` is heap-allocated (`Box`) so its address is stable even if `Engine` itself is
-/// moved; `ctx` borrows from it with a lifetime unsafely widened to `'static` to make the two
-/// co-resident in one struct (a standard self-referential-via-heap-indirection pattern for
-/// this crate). Field declaration order (`ctx` before `model` before `backend`) controls drop
-/// order, ensuring `ctx` is dropped before the `model`/`backend` it borrows from.
+/// moved; `ctx` borrows from it (and from the process-wide `shared_backend()`) with a
+/// lifetime unsafely widened to `'static` to make the two co-resident in one struct (a
+/// standard self-referential-via-heap-indirection pattern for this crate). Field declaration
+/// order (`ctx` before `model`) controls drop order, ensuring `ctx` is dropped before the
+/// `model` it borrows from. The backend itself is not an owned field (see `shared_backend()`)
+/// — it is a process-wide `'static` singleton shared by every `Engine`, so it needs no drop
+/// ordering relative to `ctx`/`model` here.
 pub struct Engine {
     ctx: LlamaContext<'static>,
     model: Box<LlamaModel>,
-    backend: LlamaBackend,
     n_vocab: i32,
 }
 
@@ -55,13 +85,13 @@ impl Engine {
     /// Loads a GGUF model from `model_path` and creates a persistent CPU-only inference
     /// context per `config`.
     pub fn load(model_path: &Path, config: EngineConfig) -> Result<Self, EngineError> {
-        let backend = LlamaBackend::init().map_err(|e| EngineError::BackendInit(e.to_string()))?;
+        let backend = shared_backend()?;
 
         // CPU-only: n_gpu_layers = 0 explicitly (llama-cpp-2's own default is -1 = "auto
         // offload if a GPU backend is compiled in"; we never build with one, but pin this
         // anyway so intent is explicit and future Cargo.toml changes can't silently offload).
         let model_params = LlamaModelParams::default().with_n_gpu_layers(0);
-        let model = LlamaModel::load_from_file(&backend, model_path, &model_params)
+        let model = LlamaModel::load_from_file(backend, model_path, &model_params)
             .map_err(|e| EngineError::ModelLoad(e.to_string()))?;
         let model = Box::new(model);
         let n_vocab = model.n_vocab();
@@ -80,13 +110,12 @@ impl Engine {
             .with_n_threads(config.n_threads)
             .with_n_threads_batch(config.n_threads);
         let ctx = model_ref
-            .new_context(&backend, ctx_params)
+            .new_context(backend, ctx_params)
             .map_err(|e| EngineError::ContextInit(e.to_string()))?;
 
         Ok(Self {
             ctx,
             model,
-            backend,
             n_vocab,
         })
     }
