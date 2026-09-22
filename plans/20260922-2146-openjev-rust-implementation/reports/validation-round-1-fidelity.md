@@ -1,0 +1,23 @@
+### 4.C Fidelity — 1 MINOR
+
+Commands run:
+- `ls -la "C:\Users\nguyendk\Documents\Projects\openjev"` — confirms greenfield (only `.claude/`, `docs/`, `plans/`; no `Cargo.toml`/`src/`/git).
+- `ls -la "...\plans\20260922-2146-openjev-rust-implementation"` — plan.md + phase-00..06 + `research/` + `reports/` all present.
+- `ls -la "...\plans\...\research"` — `researcher-01-llama-cpp-2-engine.md`, `researcher-02-cli-http-architecture.md`, `researcher-03-model-acquisition.md`, `researcher-04-testing-strategy.md` all present.
+- `ls -la "C:\Users\nguyendk\Documents\Projects\openjev\docs\research"` — `openjev-rust-research.md` present.
+- Read: plan.md, phase-00..06 (full), research/researcher-01/02/03/04 (full), docs/research/openjev-rust-research.md (full).
+- `grep -n "MODIFY|CREATE" phase-*.md` (Related Code Files sections, all 7 phase files) — evidence for §4.C.1 below.
+
+**§4.C.1 — MODIFY/CREATE targets vs. actual/planned files**
+Every MODIFY target traces to an earlier phase's CREATE (no orphan MODIFY): `Cargo.toml`/`src/main.rs` MODIFY'd by Phases 1/4/5/6 ← CREATE'd by Phase 0 (phase-00-spike-verification.md:50,53); `src/pipeline/mod.rs` MODIFY'd by Phase 3 ← CREATE'd by Phase 2 (phase-03-pipeline-generation.md:67, phase-02-pipeline-constrained-readout.md:62); `src/cli/mod.rs` MODIFY'd by Phase 5 ← CREATE'd by Phase 4 (phase-05-http-api-serve.md:68, phase-04-cli-bench.md:67). No BLOCKER (no MODIFY target claimed-pre-existing-but-absent).
+
+MINOR: plan.md's "Parallel Execution Matrix" (plan.md:112-124) claims Phase 2 owns only `src/pipeline/readout.rs`, Phase 3 owns only `src/pipeline/generate.rs`, and states "Phases 2/3 touch disjoint files (no overlap)" (plan.md:123) — and analogously Phase 4 owns only `src/cli/**`, Phase 5 only `src/server/**`, "Phases 4/5 touch disjoint files (no overlap)" (plan.md:123-124). This contradicts the phase files' own Related Code Files sections: Phase 2 (phase-02:62,65) and Phase 3 (phase-03:67,71) both CREATE/MODIFY `src/pipeline/mod.rs` AND `src/pipeline/error.rs` in the same parallel wave; Phase 4 (phase-04:72) and Phase 5 (phase-05:70) both MODIFY `src/main.rs`, and Phase 4 CREATEs / Phase 5 MODIFYs `src/cli/mod.rs` (phase-04:67, phase-05:68). The `mod.rs`/`main.rs` overlaps are explicitly acknowledged with coordination instructions inside the phase files themselves ("each phase should only append its own `pub mod` line" — phase-03:70; "coordinate: this phase adds the enum shape, Phase 5 fills in ... if it lands after" — phase-04:69-70), but `src/pipeline/error.rs` (phase-02:65, phase-03:71) has no equivalent explicit merge-coordination note, and none of these four shared files appear in plan.md's summary ownership table at all. Low real-world risk (additive edits — new enum variants/mod lines), but the plan's own top-level "no overlap" claim is factually inconsistent with its phase-file details.
+
+**§4.C.2 — API/symbol fidelity vs. research verified/unverified split**
+Phase 0 (phase-00:28-79) correctly gates all 5 unresolved items before Phase 1+ code: model repo ids (MiniCPM/Qwen-4B naming — researcher-03:16-41, both explicitly UNVERIFIED/INFERRED, matches plan.md:42-51 Unresolved #1-2 verbatim), `hf-hub` API shape (researcher-03:43-71, explicitly flagged conflicting/UNVERIFIED, matches plan.md:52-56 Unresolved #3), `llama-cpp-2` logits/KV-cache/chat-template API (researcher-01:37-50,113-126, explicitly "Inferred, not directly confirmed"/"Unverified", matches plan.md:57-64 Unresolved #4). Phase 1's implementation steps defer to "the confirmed ... signature from Phase 0" rather than asserting the unverified API as fact (phase-01:90-91, phase-01:22-23 cites the one item R1 DID verify — `LlamaBatch::add` — correctly, per researcher-01:17-35). No BLOCKER: no phase treats an unverified claim as ground truth without a Phase-0 gate.
+
+**§4.C.3 — Cargo layout (single package vs. workspace)**
+plan.md:74-75 ("Single Cargo package ... not a multi-crate workspace ... per R2 §1") matches researcher-02-cli-http-architecture.md:12 ("single-binary-with-subcommands is the simpler KISS-aligned choice matching precedent"). No contradiction. PASS.
+
+**§4.C.4 — Research file staleness / path fidelity**
+All 4 researcher files and `docs/research/openjev-rust-research.md` exist at the exact paths cited throughout plan.md and all phase files (verified via `ls` above). Section references (`docs/research/openjev-rust-research.md` §1/§2/§4, researcher-01 §1-4, researcher-02 §1-4, researcher-03 §1-4, researcher-04 §1-4) all correspond to actual `##`-numbered sections in those files on read. No staleness detected — all files were written in this same session (timestamps 21:39-21:56 today) and are internally consistent with what phase files cite. PASS.

@@ -1,0 +1,9 @@
+[package]
+name = "pipeline"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+engine = { path = "../engine" }
+models = { path = "../models" }
+timing = { path = "../timing" }

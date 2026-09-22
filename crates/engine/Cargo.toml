@@ -1,0 +1,9 @@
+[package]
+name = "engine"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+llama-cpp-2 = "0.2"
+models = { path = "../models" }
+timing = { path = "../timing" }
