@@ -28,9 +28,11 @@ struct Cli {
     #[arg(long, default_value = "json")]
     format: String,
 
-    /// Accepted for forward-compat with the planned Laya scoring path — currently a NO-OP:
-    /// Laya (`ggmlc-run`-backed classification scoring) is not implemented yet (Loop 3+).
-    /// This flag does not change any current behavior.
+    /// When set, skips the Laya comparison method (calling the separately-running `laya serve`
+    /// process) — `laya` stays `null` in the output and both `laya_*` timing fields stay 0.
+    /// When absent (default), Laya IS called; if `laya serve` is unreachable the request still
+    /// succeeds (readout/generate are unaffected) but `laya` is `null` and a warning is printed
+    /// to stderr.
     #[arg(long)]
     skip_laya: bool,
 }
@@ -43,6 +45,7 @@ struct CliOutput {
     timings: Timings,
     readout: ReadoutResult,
     generate: GenerateResult,
+    laya: Option<models::LayaScoreResult>,
 }
 
 fn main() {
@@ -101,8 +104,25 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     let generate = run_generate(&mut engine, &cli.prompt, &cli.options)?;
     timings.generation_ms = t0.elapsed().as_millis();
 
-    // Laya (laya_model_load_ms / laya_inference_ms) is not implemented yet (Loop 3+); left at
-    // Timings::default()'s 0. `--skip-laya` is currently a no-op for the same reason.
+    // 7. Laya (3rd comparison method): calls the separately-running `laya serve` process.
+    // `laya_model_load_ms` stays 0 (the model loads once at `laya serve` startup, not
+    // per-request — see `pipeline::laya::run_laya`'s doc comment). Unreachable/erroring Laya
+    // degrades gracefully: readout/generate above already succeeded, so we don't fail the whole
+    // run — `laya` stays `None` and a warning goes to stderr instead.
+    let laya = if cli.skip_laya {
+        None
+    } else {
+        let t0 = Instant::now();
+        let result = pipeline::run_laya(&cli.prompt, &cli.options);
+        timings.laya_inference_ms = t0.elapsed().as_millis();
+        match result {
+            Ok(laya) => Some(laya),
+            Err(e) => {
+                eprintln!("warning: laya unavailable, continuing without it: {e}");
+                None
+            }
+        }
+    };
 
     let output = CliOutput {
         model: cli.model.clone(),
@@ -111,6 +131,7 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         timings,
         readout,
         generate,
+        laya,
     };
     println!("{}", serde_json::to_string_pretty(&output)?);
     Ok(())

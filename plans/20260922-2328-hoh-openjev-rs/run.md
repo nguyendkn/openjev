@@ -80,6 +80,20 @@ fast/calibrated positioning) by default. Not yet scheduled to a specific loop nu
 here so it isn't lost; likely Loop 5-6 after all 3 methods + 4 models work on the primary
 `/bench` endpoint.
 
+## Corrected understanding: Laya's real tool is `laya`, not `ggmlc-run` (Loop 5)
+
+Main agent read Laya's real HF model card + `examples/laya/README.md` on GitHub directly
+(2026-09-23) — supersedes Loop 1's exploration of the generic `ggmlc-run` binary. The real
+tool is a separate `laya` binary (build target `examples/laya` in the `ggmlc` repo). Critically:
+`laya serve <model> --port <p>` is **already a byte-compatible TypeSafe System One HTTP
+server** (`POST /v1/systemone`, `/v1/decide`, `GET /health`) — confirms researcher-06's Jev
+contract findings from an independent source. Design: run `laya serve` as a persistent
+localhost-only background process on the server, `crates/models::laya` becomes an HTTP client
+calling it (not a per-request CLI shell-out) — warm model, no per-call reload cost. See
+`loop-05-dev-doc.md` for full detail. This also means a FUTURE Jev-compatible endpoint on our
+own `apps/server` could just reverse-proxy to the already-running `laya serve` process instead
+of reimplementing the protocol — worth considering when that later loop happens.
+
 ## Loops
 
 | Loop | Status | D_t | A_t | E_t | gaps | regressions |
@@ -88,6 +102,15 @@ here so it isn't lost; likely Loop 5-6 after all 3 methods + 4 models work on th
 | 2 | delivered | loop-02-dev-doc.md | (workspace + remote server, real engine/models/pipeline, Qwen3-0.6B e2e via CLI) | loop-02-evidence.md | 3 new (G9/G10/G11), G3/G4/G5 closed | 0 |
 | 3 | delivered | loop-03-dev-doc.md | (apps/server live on 103.146.166.46:80, curl-verified externally, commit ba0155b) | loop-03-evidence.md | 3 new (G12/G13/G14), 0 closed | 0 |
 | 4 | delivered | loop-04-dev-doc.md | (all 3 LLM models live via CLI+HTTP, shared_backend fix, G13 respawn-supervisor proven) | loop-04-evidence.md | 2 new (G15/G16), G9/G13 closed | 0 |
+| 5 | delivered | loop-05-dev-doc.md | (Laya wired via laya serve HTTP client, real 3-way BenchReport) | loop-05-evidence.md | G17 new, G6/G7-Linux/G8/G15 closed | 0 |
+
+**DoD status after Loop 5**: items 1-4 ALL MET — server live, health 200, bench-via-curl valid,
+all 3 LLM models + Laya benchmarked successfully via external curl (independently re-verified
+by Runtime.check). Item 6 (no-auth) trivially true. **Only item 5 remains: the continuous
+performance-tuning loop.** New gap G17 (Laya server binds 0.0.0.0 without auth, README's
+`127.0.0.1`-only claim is false) — security-relevant but non-blocking per explicit no-auth-
+this-round scope; cheap mitigation (local firewall rule restricting :8090 to localhost) worth
+folding into Loop 6 if trivial.
 
 **DoD status after Loop 4**: items 1-3 MET (server, health, bench-via-curl). Item 4: 3/4 models
 done (Qwen3-0.6B, MiniCPM5-2B, Qwen3-4B all verified via external curl + CLI) — only Laya

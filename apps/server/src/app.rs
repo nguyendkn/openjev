@@ -7,7 +7,7 @@ use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{get, post};
 use axum::Router;
 use engine::{Engine, EngineConfig};
-use pipeline::{run_generate, run_readout, GenerateResult, ReadoutResult};
+use pipeline::{run_generate, run_laya, run_readout, GenerateResult, ReadoutResult};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::Instant;
@@ -20,6 +20,11 @@ pub struct BenchRequest {
     pub model: String,
     pub prompt: String,
     pub options: Vec<String>,
+    /// When true, skips the Laya comparison method — `laya: null`, both `laya_*` timing fields
+    /// stay 0. Defaults to `false` (Laya IS called) when omitted, matching `apps/cli`'s
+    /// `--skip-laya` flag default.
+    #[serde(default)]
+    pub skip_laya: bool,
 }
 
 /// Same field names/shape as `apps/cli`'s `CliOutput` JSON so both surfaces agree.
@@ -31,6 +36,7 @@ pub struct BenchReport {
     pub timings: Timings,
     pub readout: ReadoutResult,
     pub generate: GenerateResult,
+    pub laya: Option<models::LayaScoreResult>,
 }
 
 /// One benchmark job handed to the dedicated engine-worker thread.
@@ -105,7 +111,7 @@ fn supervisor_loop(mut rx: mpsc::Receiver<WorkerJob>) {
         match outcome {
             Ok(()) => return, // rx closed normally (all Senders/AppState clones dropped)
             Err(payload) => {
-                let msg = panic_message(&payload);
+                let msg = panic_message(&*payload);
                 eprintln!(
                     "engine worker thread panicked, respawning with an empty model cache: {msg}"
                 );
@@ -185,6 +191,11 @@ impl From<pipeline::PipelineError> for ApiError {
         match e {
             pipeline::PipelineError::InvalidOptions(m) => ApiError::InvalidOptions(m),
             pipeline::PipelineError::Engine(m) => ApiError::Engine(m),
+            // Not expected to ever reach here: `run_bench` handles `run_laya`'s `Result`
+            // directly (matching `Ok`/`Err` inline, never using `?`) so a Laya failure degrades
+            // to `laya: None` instead of becoming an `ApiError`. Mapped anyway for exhaustiveness
+            // and defense-in-depth if `run_laya` is ever called with `?` elsewhere.
+            pipeline::PipelineError::Laya(m) => ApiError::Internal(m),
         }
     }
 }
@@ -251,6 +262,26 @@ fn run_bench(engines: &mut HashMap<String, Engine>, req: BenchRequest) -> Result
     let generate = run_generate(engine, &req.prompt, &req.options)?;
     timings.generation_ms = t0.elapsed().as_millis();
 
+    // Laya (3rd comparison method): calls the separately-running `laya serve` process (see
+    // `pipeline::laya::run_laya`). `laya_model_load_ms` stays 0 (model loads once at `laya
+    // serve` startup, not per-request). Unreachable/erroring Laya degrades gracefully — the
+    // readout/generate results above already succeeded, so a Laya failure must not 500 the
+    // whole request; `laya` stays `None` and the failure is only logged.
+    let laya = if req.skip_laya {
+        None
+    } else {
+        let t0 = Instant::now();
+        let result = run_laya(&req.prompt, &req.options);
+        timings.laya_inference_ms = t0.elapsed().as_millis();
+        match result {
+            Ok(laya) => Some(laya),
+            Err(e) => {
+                eprintln!("laya unavailable, continuing without it: {e}");
+                None
+            }
+        }
+    };
+
     Ok(BenchReport {
         model: req.model,
         prompt: req.prompt,
@@ -258,6 +289,7 @@ fn run_bench(engines: &mut HashMap<String, Engine>, req: BenchRequest) -> Result
         timings,
         readout,
         generate,
+        laya,
     })
 }
 

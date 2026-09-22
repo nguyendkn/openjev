@@ -6,6 +6,11 @@ use std::fmt;
 pub enum PipelineError {
     Engine(String),
     InvalidOptions(String),
+    /// Laya (`laya serve`) call failed — unreachable or an unexpected response. Distinct from
+    /// `Engine` because a Laya failure is expected to degrade gracefully (readout/generate still
+    /// succeed, `laya: null` in the report) rather than fail the whole request; callers decide
+    /// whether to propagate or swallow this variant per that policy.
+    Laya(String),
 }
 
 impl fmt::Display for PipelineError {
@@ -13,6 +18,7 @@ impl fmt::Display for PipelineError {
         match self {
             PipelineError::Engine(e) => write!(f, "engine error: {e}"),
             PipelineError::InvalidOptions(e) => write!(f, "invalid options: {e}"),
+            PipelineError::Laya(e) => write!(f, "laya error: {e}"),
         }
     }
 }

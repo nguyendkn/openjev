@@ -14,7 +14,7 @@ OpenJev-RS compares these independent inference paths on the same MCQ dataset:
 
 2. **JSON Generation** — Greedy decoding (max 512 tokens), strip reasoning tags (`<think>...</think>`), parse and validate JSON schema, flexible multi-token reasoning. Typical latency: <500ms per decision.
 
-3. **Laya Single-Pass Encoder** — External subprocess (`ggmlc-run` CLI) running ModernBERT for calibrated probability estimates. Typical latency: <150ms per decision (CPU; GPU ~25ms).
+3. **Laya Single-Pass Encoder** — A persistent `laya serve` HTTP process (separate `laya` binary built from `examples/laya` in the `ggmlc` repo — NOT the generic `ggmlc-run` CLI) running the Laya encoder model for calibrated probability estimates; `crates/models::laya` is a blocking HTTP client to `http://127.0.0.1:8090/v1/decide`. Real CPU latency (cold `laya decide` CLI, includes model load): ~39.6s; warm `laya serve` HTTP round-trip (model already loaded): ~7.5-8.9s per decision on the target server.
 
 Each runs against all three models (Qwen3-0.6B, MiniCPM-2B, Qwen3-4B), producing a 3×3 latency matrix.
 
@@ -57,6 +57,27 @@ cargo test --workspace
 
 See `Makefile` for additional targets (`fmt`, `clippy`, `ci` suite).
 
+### Laya Server Process (Loop 5+)
+
+`apps/server`/`apps/cli`'s Laya scoring method calls a **second, separately-running process**:
+the `laya` binary (built from `examples/laya` in the `ggmlc` repo — NOT the generic `ggmlc-run`
+runner) started as `laya serve <model.gguf> --port 8090 --device cpu`, bound to `127.0.0.1:8090`
+(no external exposure needed — only `openjev-cli`/`openjev-server` on the same host call it).
+The GGUF is loaded once at `laya serve` startup and kept warm; `crates/models::laya` is a
+blocking HTTP client (`reqwest`) POSTing to `http://127.0.0.1:8090/v1/decide` per request, not a
+per-request shell-out.
+
+On the target Linux server there are therefore **two long-running processes** to manage:
+- `openjev-server` (port 80, external) — started via `setsid nohup ./target/release/openjev-server --port 80 >logs/server.log 2>&1 & disown`.
+- `laya serve` (port 8090, localhost-only) — started via `setsid nohup <path-to-laya-binary> serve <path-to-laya.gguf> --port 8090 --device cpu >logs/laya-serve.log 2>&1 & disown`.
+
+Check status: `curl http://127.0.0.1/health` (server) and `curl http://127.0.0.1:8090/health`
+(laya serve, from the server itself — not externally reachable by design). Restart either
+independently by killing its PID (`ps aux | grep openjev-server` / `ps aux | grep 'laya serve'`)
+and re-running its start command above; `apps/server` degrades gracefully (`laya: null` in every
+`BenchReport`, no request failure) whenever `laya serve` is down, and self-heals on `laya
+serve`'s next successful response — no `openjev-server` restart needed either way.
+
 ---
 
 ## Project Status
@@ -66,7 +87,7 @@ See `Makefile` for additional targets (`fmt`, `clippy`, `ci` suite).
 **What exists:**
 - Workspace skeleton: 6-crate structure (timing, models, engine, pipeline, cli, server) all declared in `Cargo.toml`.
 - `crates/timing`: Complete `Timings` struct (27 lines) capturing 7-stage wall-clock measurements.
-- Phase 0 verification: llama-cpp-2 API shape, hf-hub behavior, model repository IDs, and Laya subprocess integration all under validation (see `docs/project-overview-pdr.md` §8 for 8 open items).
+- Phase 0 verification: llama-cpp-2 API shape, hf-hub behavior, model repository IDs, and Laya HTTP integration (`laya serve` + blocking HTTP client, not a shell-out) all under validation (see `docs/project-overview-pdr.md` §8 for 8 open items — items 6-8, Laya-specific, resolved in Loop 5).
 
 **What's NOT working yet:**
 - Model download and loading (Phase 1).
@@ -88,7 +109,7 @@ Four authoritative docs guide development and architecture:
 
 - **[`docs/code-standards.md`](docs/code-standards.md)** — Locked engineering rules: error handling patterns, API design conventions, testing strategy (≥90% line, ≥75% branch coverage), CPU-only constraint, and Cargo discipline.
 
-- **[`docs/system-architecture.md`](docs/system-architecture.md)** — End-to-end pipeline flows for all three scoring methods, request/response shapes (CLI + HTTP), external integrations (Hugging Face hf-hub, subprocess ggmlc-run), timing breakdown per stage, and deployment topology (dev/prod).
+- **[`docs/system-architecture.md`](docs/system-architecture.md)** — End-to-end pipeline flows for all three scoring methods, request/response shapes (CLI + HTTP), external integrations (Hugging Face hf-hub, `laya serve` HTTP process — see "Laya Server Process" below), timing breakdown per stage, and deployment topology (dev/prod).
 
 Start with `project-overview-pdr.md` to understand the scope and Phase 0 blockers.
 
@@ -100,7 +121,7 @@ Start with `project-overview-pdr.md` to understand the scope and Phase 0 blocker
 |-------|-------|------|---|
 | **0** | Spike Verification | Resolve 8 unresolved items (model IDs, API shapes, licensing) via primary source. | ~2 days |
 | **1** | Engine / Models / Timing | Load models via llama-cpp-2, download + cache via hf-hub, populate `Timings` struct. | ~3 days |
-| **2** | Pipeline — Readout + Laya | Constrained-softmax over options, Laya shell-out subprocess wrapper. | Parallel with Phase 3 |
+| **2** | Pipeline — Readout + Laya | Constrained-softmax over options, Laya HTTP client wrapper (`laya serve`, not a shell-out). | Parallel with Phase 3 |
 | **3** | Pipeline — Generation | Greedy 512-token decode, strip `<think>` tags, JSON schema validation. | Parallel with Phase 2 |
 | **4** | CLI Binary | Parse args, orchestrate 3 pipelines, JSON/text output, exit codes. | Parallel with Phase 5 |
 | **5** | HTTP Server | axum routes (`POST /bench`, `GET /health`), Arc<Mutex> serialization, spawn_blocking. | Parallel with Phase 4 |

@@ -1,6 +1,6 @@
 # OpenJev-rs Codebase Summary
 
-Rust port of OpenJev/SemIf (CPU-only LLM benchmark: constrained-readout vs generation). **Loop 4 (HoH) stage** — `engine`/`models`/`pipeline`/`apps/cli`/`apps/server` are all implemented and running real inference (not stubs); 3 of 4 registered LLM models (`qwen3-0.6b`, `minicpm5-2b`, `qwen3-4b`) verified end-to-end via both `apps/cli` and a live external `apps/server` on `103.146.166.46:80` (`laya` model + Laya scoring path remain unimplemented, tracked for Loop 5+). See `docs/research/openjev-rust-research.md` for reference architecture and `plans/20260922-2328-hoh-openjev-rs/loops/` for the current HoH loop history (source of truth for what changed since Phase 0).
+Rust port of OpenJev/SemIf (CPU-only LLM benchmark: constrained-readout vs generation vs Laya). **Loop 5 (HoH) stage** — `engine`/`models`/`pipeline`/`apps/cli`/`apps/server` are all implemented and running real inference (not stubs); all 3 registered LLM models (`qwen3-0.6b`, `minicpm5-2b`, `qwen3-4b`) verified end-to-end via both `apps/cli` and a live external `apps/server` on `103.146.166.46:80`. Laya (the 3rd comparison method, `laya` registry entry) is now wired as a blocking HTTP client to a persistent `laya serve` process (NOT the generic `ggmlc-run` CLI Loop 1 explored, and NOT a per-request shell-out — see "Laya Server Process" in README) — `--skip-laya`/`skip_laya` is genuinely real, not a no-op. See `docs/research/openjev-rust-research.md` for reference architecture and `plans/20260922-2328-hoh-openjev-rs/loops/` for the current HoH loop history (source of truth for what changed since Phase 0).
 
 ---
 
@@ -9,11 +9,11 @@ Rust port of OpenJev/SemIf (CPU-only LLM benchmark: constrained-readout vs gener
 ```
 openjev/
 ├── apps/
-│   ├── cli/              → openjev-cli binary (one-shot benchmark run, --skip-laya planned)
+│   ├── cli/              → openjev-cli binary (one-shot benchmark run, --skip-laya real, Loop 5)
 │   └── server/           → openjev-server binary (axum HTTP API: POST /bench, GET /health)
 ├── crates/
 │   ├── timing/           → Timings struct only (0 intra-workspace deps) [IMPLEMENTED]
-│   ├── models/           → registry + hf-hub + ggmlc-run wrapper (0 intra-workspace deps) [STUB]
+│   ├── models/           → registry + hf-hub + Laya HTTP client (`laya serve`, 0 intra-workspace deps) [STUB]
 │   ├── engine/           → GGUF loader via llama-cpp-2, LlamaContext wrapper [STUB]
 │   └── pipeline/         → 3 submodules: readout, generate, laya [STUB]
 ├── docs/
@@ -44,10 +44,10 @@ openjev/
 |--------|---------|
 | Files | `lib.rs`, `download.rs`, `laya.rs`, `error.rs` |
 | Modules Declared | `download`, `laya`, `error` |
-| Purpose | Model registry (`REGISTRY`, 4 entries, exact ids: `qwen3-0.6b`, `qwen3-4b`, `minicpm5-2b`, `laya`), `hf-hub`-backed cache-aware download (`ensure_downloaded`), `find(id)` lookup |
-| Dependencies | `hf-hub` 1.0, `serde` 1.0 |
+| Purpose | Model registry (`REGISTRY`, 4 entries, exact ids: `qwen3-0.6b`, `qwen3-4b`, `minicpm5-2b`, `laya`), `hf-hub`-backed cache-aware download (`ensure_downloaded`), `find(id)` lookup; `laya::score()` — blocking HTTP client (`reqwest`) to a persistent `laya serve` process at `http://127.0.0.1:8090/v1/decide` |
+| Dependencies | `hf-hub` 1.0, `serde` 1.0, `serde_json` 1.0, `reqwest` 0.13 (blocking+json+rustls — reused from `hf-hub`'s existing dependency tree, no second HTTP stack added) |
 | Deps Within Workspace | None |
-| Status | 3 of 4 entries (`qwen3-0.6b`, `qwen3-4b`, `minicpm5-2b`) downloaded, cached, and exercised end-to-end (Loops 1-4). `laya` entry has real registry data but the Laya scoring path (`laya.rs`, `ggmlc-run` wrapper) is unimplemented — Loop 5+. |
+| Status | All 4 registry entries (`qwen3-0.6b`, `qwen3-4b`, `minicpm5-2b`, `laya`) exercised end-to-end (LLM models Loops 1-4, Laya Loop 5). `laya.rs` is a real HTTP client (Loop 5) — corrected from the earlier planned `ggmlc-run` shell-out; the real Laya tool is a separate `laya` binary run as `laya serve`, called over HTTP, not shelled out to per-request. |
 
 ### `crates/engine` — **IMPLEMENTED**
 | Aspect | Details |
@@ -61,12 +61,12 @@ openjev/
 ### `crates/pipeline` — **IMPLEMENTED**
 | Aspect | Details |
 |--------|---------|
-| Files | `lib.rs`, `readout.rs`, `generate.rs`, `laya.rs` (stub), `error.rs` |
+| Files | `lib.rs`, `readout.rs`, `generate.rs`, `laya.rs`, `error.rs` |
 | Modules Declared | `readout`, `generate`, `laya`, `error` |
-| Purpose | Constrained single-token readout (`run_readout`, softmax restricted to option-label token ids) and greedy generation (`run_generate`) both implemented and used by `apps/cli`/`apps/server`; `laya` (external `ggmlc-run` scoring) still a stub |
+| Purpose | Constrained single-token readout (`run_readout`, softmax restricted to option-label token ids), greedy generation (`run_generate`), and Laya scoring (`run_laya`, wraps `models::laya::score()`) — all 3 implemented and used by `apps/cli`/`apps/server` as of Loop 5 |
 | Dependencies | `engine`, `models`, `timing` |
 | Deps Within Workspace | `engine`, `models`, `timing` |
-| Status | `readout`/`generate` implemented, unit-tested (3 tests in `readout.rs`), and verified against 3 real models. `laya.rs` unimplemented (Loop 5+; G10 — `generate.rs` has no committed unit tests — tracked, non-blocking). |
+| Status | `readout`/`generate` implemented, unit-tested (3 tests in `readout.rs`), and verified against 3 real models. `laya.rs` implemented Loop 5 (real HTTP client to `laya serve`, verified end-to-end via `apps/cli`/`apps/server`, no dedicated unit test — G10/G12, tracked, non-blocking; `generate.rs` also still has no committed unit tests, same G10). |
 
 ### `apps/cli` — **IMPLEMENTED**
 | Aspect | Details |
@@ -105,7 +105,7 @@ timing (0 workspace deps)
   │
   └─── pipeline (depends: engine, models, timing)
          ├─── engine, models, timing
-         └─── (no external crate deps declared yet; readout/generate/laya logic TBD)
+         └─── serde_json 1.0 (JSON parsing for `generate`); readout/generate/laya all implemented (Loop 5)
 
 apps/cli (depends: all core crates)
   ├─── clap 4.4 (derive)         (CLI arg parsing)
@@ -210,7 +210,7 @@ Original Phase 0-7 plan (`plans/20260922-2146-openjev-rust-implementation/`) was
 | **Phase 4** | CLI: bench subcommand, run both pipelines, JSON output | `apps/cli/src/main.rs` | **Done** (Loop 2), re-verified for 3 models (Loop 4) |
 | **Phase 5** | HTTP API: `POST /bench`, `GET /health` | `apps/server/src/main.rs` | **Done** (Loop 3), panic-supervised worker + 3-model verification (Loop 4) |
 | **Phase 6** | Tests: unit + integration (real model), coverage | `tests/` (new) | Partial — 3 unit tests in `pipeline/readout.rs`; `generate.rs` (G10) and `apps/server` (G12) have no committed unit tests (black-box HTTP validation covers `apps/server` instead). Not blocking so far. |
-| **Phase 7** | E2E server tuning, deployment automation | — | Not started (Laya scoring, load/perf tuning — Loop 5+) |
+| **Phase 7** | E2E server tuning, deployment automation | — | Laya scoring now wired (Loop 5); load/perf tuning proper still not started |
 
 ### Critical Unresolved Items (Phase 0) — resolution status
 1. **Model repo IDs** — resolved. Exact registry (`crates/models/src/download.rs::REGISTRY`): `qwen3-0.6b`→`Qwen/Qwen3-0.6B-GGUF`, `qwen3-4b`→`Qwen/Qwen3-4B-GGUF`, `minicpm5-2b`→`openbmb/MiniCPM5-2B-GGUF` (note: `MiniCPM5`, not the originally-assumed `MiniCPM-2B`), `laya`→`mys/laya-GGUF`. All 4 pinned to a resolved commit SHA.
@@ -226,11 +226,12 @@ Original Phase 0-7 plan (`plans/20260922-2146-openjev-rust-implementation/`) was
 Validation Round 1 (Phase 0 planning-time) findings below are historical/superseded — the plan structure they describe (`src/pipeline/mod.rs`, `src/cli/mod.rs`, Phase numbering) was replaced by the actual `crates/`+`apps/` workspace layout and the HoH loop process. Kept for history; see `plans/20260922-2146-openjev-rust-implementation/reports/` for the original detail.
 
 **Current known issues** (tracked in `plans/20260922-2328-hoh-openjev-rs/loops/issue-ledger.md`):
-- **G9** — this file and `docs/project-overview-pdr.md` were stale relative to code; Loop 4 refreshed both (this edit).
+- **G9** — this file and `docs/project-overview-pdr.md` were stale relative to code; Loop 4 refreshed both, Loop 5 refreshed the Laya-specific parts.
 - **G10** — `crates/pipeline/generate.rs` has no committed unit tests (black-box CLI/HTTP validation covers it instead).
 - **G12** — `apps/server/src/{app,main}.rs` has no committed unit tests (black-box HTTP validation covers it instead).
 - **G14** — `apps/server` binds port 80 (root, no auth) instead of an unprivileged port; accepted deviation, documented residual risk (root-bind, future reverse-proxy collision, more-probed port).
-- **Laya** — `crates/pipeline/laya.rs` and the `ggmlc-run` scoring wrapper in `crates/models` are unimplemented; `laya_model_load_ms`/`laya_inference_ms` are always `0` in every `Timings` observed so far. Loop 5+.
+- **G15** — `apps/server/src/app.rs`'s `panic_message()` was passing `&payload` instead of `&*payload`, so `downcast_ref` never matched real `&str`/`String` panic payloads (always logged `<non-string panic payload>`). Fixed in Loop 5 (`panic_message(&*payload)`); verified via fault-injection — real panic message now logs correctly.
+- **Laya — RESOLVED (Loop 5).** `crates/pipeline/laya.rs`/`crates/models/laya.rs` are implemented: a blocking HTTP client to a persistent `laya serve` process (see README's "Laya Server Process"), NOT the generic `ggmlc-run` CLI Loop 1 explored and NOT a per-request shell-out. `laya_model_load_ms` stays 0 by design (model loads once at `laya serve` startup); `laya_inference_ms` is now genuinely populated (~7.5-8.9s per call on the target CPU server, warm). `--skip-laya`/`skip_laya` is real (was a documented no-op through Loop 4). Verified end-to-end via `apps/cli` and external `apps/server` `/bench` curl, including graceful degradation (`laya: null`, no 500) when `laya serve` is down, and self-heal on its next successful response.
 
 **Historical (Phase 0 planning-time) findings, superseded:**
 - Structural BLOCKERs (2): `src/pipeline/mod.rs` & `src/cli/mod.rs` written by parallel phases; contradicted the original plan.md "no overlap" claim — moot, actual layout is `crates/pipeline`, `apps/cli`.
@@ -243,14 +244,14 @@ Validation Round 1 (Phase 0 planning-time) findings below are historical/superse
 
 - **Workspace:** 6-crate, single-resolver
 - **Executables:** 2 (`openjev-cli`, `openjev-server`)
-- **Models Registry:** 4 hardcoded entries (`qwen3-0.6b`, `qwen3-4b`, `minicpm5-2b`, `laya`); first 3 downloaded, cached, and verified end-to-end via both binaries (Loop 4), `laya` registry data present but not exercised (no Laya scoring path yet)
-- **Benchmark Dimensions:** 7 timed phases (model-load, warmup, tokenize, constrained-readout, generation, laya-model-load, laya-inference) — the two `laya_*` fields are always `0` until Laya scoring is implemented
+- **Models Registry:** 4 hardcoded entries (`qwen3-0.6b`, `qwen3-4b`, `minicpm5-2b`, `laya`); all 4 exercised end-to-end via both binaries (LLM models Loop 4, Laya Loop 5)
+- **Benchmark Dimensions:** 7 timed phases (model-load, warmup, tokenize, constrained-readout, generation, laya-model-load, laya-inference) — `laya_model_load_ms` stays `0` by design (Laya's model loads once at `laya serve` startup, not per-request); `laya_inference_ms` is now genuinely populated (Loop 5) unless `--skip-laya`/`skip_laya` is set
 - **Inference Runtime:** llama.cpp via `llama-cpp-2` (CPU-only, quantized GGUF), one process-wide shared `LlamaBackend` (Loop 4 fix enabling multi-model caching in one process)
-- **Scoring:** External `ggmlc-run` CLI for Laya (no FFI) — binary present on the server, wrapper unimplemented
-- **Code Maturity:** `engine`/`models`/`pipeline`/`apps/cli`/`apps/server` all implemented and running real inference; live externally-reachable server on `103.146.166.46:80`; remaining gaps are test coverage (G10/G12, non-blocking, black-box-covered) and Laya (Loop 5+)
+- **Scoring:** Laya via a persistent `laya serve` HTTP process (separate `laya` binary, built from `examples/laya` in the `ggmlc` repo) + a blocking `reqwest` client in `crates/models` — not the generic `ggmlc-run` CLI, not a per-request shell-out (corrected in Loop 5)
+- **Code Maturity:** `engine`/`models`/`pipeline`/`apps/cli`/`apps/server` all implemented and running real inference, including Laya as of Loop 5; live externally-reachable server on `103.146.166.46:80`; remaining gaps are test coverage (G10/G12, non-blocking, black-box-covered)
 
 ---
 
-Last updated: 2026-09-23 (Loop 4, HoH)
+Last updated: 2026-09-23 (Loop 5, HoH)
 Plan: `plans/20260922-2328-hoh-openjev-rs/` (current); `plans/20260922-2146-openjev-rust-implementation/plan.md` (original, superseded — see Known Issues)
 Research: `docs/research/openjev-rust-research.md`

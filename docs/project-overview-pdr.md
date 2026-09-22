@@ -94,7 +94,10 @@ openjev-cli \
 **`models` crate:** 
 - Static registry: 4 entries (Qwen3-0.6B/Q8_0, MiniCPM-2B/Q4_K_M default, Qwen3-4B/Q4_K_M default, Laya-en/UD_Q4_K_M).
 - hf-hub integration: download, cache, SHA256 checksum validation.
-- Laya scoring wrapper: shell-out to `ggmlc-run` CLI (no FFI, no separate crate).
+- Laya scoring wrapper: blocking HTTP client (`reqwest`) to a persistent `laya serve` process
+  (`http://127.0.0.1:8090/v1/decide`) — corrected in Loop 5; NOT the generic `ggmlc-run` CLI and
+  NOT a per-request shell-out. `laya serve` is a separate long-running process, started/managed
+  outside this crate (see README's "Laya Server Process" section).
 - Zero intra-workspace deps.
 
 **`engine` crate:**
@@ -107,7 +110,7 @@ openjev-cli \
 **`pipeline` crate (3 submodules):**
 - `readout`: constrained softmax over candidate-label logits only (BEFORE softmax, not after).
 - `generate`: greedy sampling, max_tokens=512, strip `<think>...</think>`, validate JSON schema.
-- `laya`: call into `models::laya::score()` (shell-out, don't duplicate).
+- `laya`: `run_laya()` wraps `models::laya::score()` (HTTP client to `laya serve`, don't duplicate).
 - Depends: `engine`, `models`, `timing`.
 
 ## Acceptance Criteria by Phase
@@ -115,8 +118,8 @@ openjev-cli \
 | Phase | Acceptance Criteria |
 |---|---|
 | **0: Spike** | Verify 8 unresolved items with primary-source evidence (repo source, `cargo doc`, `--help`, HF model card). Resolve workspace skeleton build (Cargo.toml structure, Rust 2021, Windows build validates). Do NOT guess. Block all later phases if any item remains unresolved. |
-| **1: Engine/Models/Timing** | ✓ Load any of 3 models via llama-cpp-2. ✓ Download + cache + checksum via hf-hub. ✓ CPU-only build (no GPU features). ✓ `n_threads` configurable. ✓ E2E: `engine::test_load_qwen_and_generate_one_token()` passes (real model, one forward pass, check logit shape). ✓ ggmlc-run wrapper compiles, `LayaRunner::score()` shell-out signature defined. ✓ Timings struct populated, all 7 fields captured. |
-| **2: Pipeline — Constrained Readout + Laya** | ✓ Given prompt + options, constrain logits to option label token IDs BEFORE softmax, return probabilities. ✓ Single forward pass, KV-cache reset after use. ✓ Laya: shell-out to `ggmlc-run`, parse output, return probabilities. ✓ E2E: `pipeline::test_readout_three_models()` passes (all 3 models, identical prompt, compare logit order). ✓ E2E: `pipeline::test_laya_scoring()` passes (Laya model load + score, check latency order-of-magnitude). |
+| **1: Engine/Models/Timing** | ✓ Load any of 3 models via llama-cpp-2. ✓ Download + cache + checksum via hf-hub. ✓ CPU-only build (no GPU features). ✓ `n_threads` configurable. ✓ E2E: `engine::test_load_qwen_and_generate_one_token()` passes (real model, one forward pass, check logit shape). ✓ Laya HTTP client (`models::laya::score()`, calls `laya serve`) compiles and works (Loop 5). ✓ Timings struct populated, all 7 fields captured (`laya_*` fields genuinely non-zero once Laya is wired, Loop 5). |
+| **2: Pipeline — Constrained Readout + Laya** | ✓ Given prompt + options, constrain logits to option label token IDs BEFORE softmax, return probabilities. ✓ Single forward pass, KV-cache reset after use. ✓ Laya: blocking HTTP client to `laya serve`, parse `answers.answer.{choice,probabilities,confidence}`, return probabilities (Loop 5, real). ✓ E2E: `pipeline::test_readout_three_models()` passes (all 3 models, identical prompt, compare logit order). Laya E2E verified via real `openjev-cli`/`apps/server` runs against a live `laya serve` (Loop 5) rather than a dedicated `pipeline::test_laya_scoring()` unit test (G10/G12, no committed unit tests for pipeline/apps — carried, non-blocking). |
 | **3: Pipeline — JSON Generation** | ✓ Greedy sampling, max_tokens=512. ✓ Strip `<think>...</think>` tags. ✓ Validate JSON schema against option set (reject if malformed). ✓ Return probabilities (conditional on shown options, NO calibration claim). ✓ E2E: `pipeline::test_generate_three_models()` passes (all 3 models, valid JSON from each, compare speed). |
 | **4: CLI Binary** | ✓ Parse args (model, prompt, options, threads, batch, skip-laya, format). ✓ Orchestrate all 3 pipelines in sequence. ✓ Output JSON (default) + text format. ✓ E2E: `openjev-cli --model qwen-0.6b --prompt "Q?" --options A B C D` completes, all 3 results present (or Laya skipped if --skip-laya). ✓ Exit code 0 on success, non-zero on error. |
 | **5: HTTP Server** | ✓ POST /bench accepts all 3 methods. ✓ GET /health returns status. ✓ Arc<Mutex> serializes inference. ✓ spawn_blocking isolates llama-cpp-2. ✓ Error handling: one method's failure does NOT abort others. ✓ E2E: `curl -X POST http://localhost:8080/bench -d {...}` returns BenchReport, all 3 results (or partial if Laya errors). |
@@ -154,11 +157,11 @@ openjev-cli \
 | 3 | hf-hub crate API | **RESOLVED** — `hf-hub` 1.0, `HFClientSync::new().model(owner,name).download_file().filename(..).revision(..).send()`; cache-aware, confirmed via 4 real cached models (`crates/models/src/download.rs`). | Resolve via `cargo add hf-hub --dry-run`, then read `cargo doc --open` or docs.rs for pinned version | Read docs.rs / local `cargo doc` against pinned version (do NOT code blind against summaries) |
 | 4 | llama-cpp-2 logits + KV-cache API | **RESOLVED** — `ctx.get_logits_ith(i)`, `ctx.clear_kv_cache()`, `model.chat_template(None)` + `apply_chat_template` (ChatML fallback if absent) — all confirmed working against 3 real models (`crates/engine/src/lib.rs`). Loop 4 additionally discovered+fixed a process-wide `LlamaBackend::init()`-can-only-succeed-once constraint not anticipated here (see `docs/codebase-summary.md` `crates/engine` entry). | Hand-build ChatML prompts (Qwen3/MiniCPM both use `<\|im_start\|>role` framing) if no wrapper exists | Read `cargo doc --open` or `llama-cpp-2/src/context.rs` + `src/model.rs` source directly |
 | 5 | Model licensing | **RESOLVED** — all 4 registry entries report `apache-2.0` via HF's `cardData.license` field (`crates/models/src/download.rs` header comment). | Keep NOTICE file if Apache-2.0 confirmed; verify in Phase 0/1 before public distribution | Read HF license metadata field for each pinned repo |
-| 6 | ggmlc-run CLI syntax | Still open — `ggmlc-run` binary is built and present on the server (`/tmp/ggmlc/build/runtime/ggmlc-run`), but the scoring subcommand/flags are not wired into `crates/models::laya` yet. Loop 5+. | N/A (unguessable; must resolve) | Read `ggmlc-run --help` after building (see #7) or Laya model card's usage snippet on HF |
-| 7 | ggmlc-run Windows build | Not applicable to current scope — dev/build/run all happen on the Linux target server, not the Windows dev machine, for this project so far. | N/A (same risk category as llama-cpp-2, not new) | Clone github.com/monatis/ggmlc, build on Windows dev machine, verify `ggmlc-run` binary runs |
-| 8 | Laya CPU latency | Still open — not measured; blocked on #6 (Laya scoring path unimplemented). | N/A (must measure) | Once #6/#7 resolved, run one quick sanity timing on a test system (not full Phase 7 tuning yet) to establish order-of-magnitude |
+| 6 | Laya CLI/server syntax | **RESOLVED (Loop 5, corrected understanding)** — the real tool for typed-decision scoring is a **separate `laya` binary** (`examples/laya` in the `ggmlc` repo, built automatically as part of the default top-level CMake build — `GGMLC_BUILD_EXAMPLES`/`GGMLC_BUILD_EXAMPLE_LAYA` are both `ON` by default, no special flag needed), NOT the generic `ggmlc-run` runner Loop 1 explored. `laya serve <model.gguf> --port <p> --device cpu` starts a persistent TypeSafe-System-One-compatible HTTP server (`POST /v1/decide`, `GET /health`); `crates/models::laya` is a blocking HTTP client, not a shell-out. Response shape confirmed via a real curl (see README's "Laya Server Process" section). | N/A (unguessable; resolved) | Read `laya help`/`examples/laya/README.md` on the real server (done, Loop 5) |
+| 7 | Laya Windows build | Not applicable to current scope — dev/build/run all happen on the Linux target server, not the Windows dev machine, for this project so far. | N/A (same risk category as llama-cpp-2, not new) | N/A — descoped alongside the general Windows build gap (G7/G1) |
+| 8 | Laya CPU latency | **RESOLVED (Loop 5)** — measured on the real target server (CPU-only, no GPU): cold one-shot `laya decide` CLI (includes model load) ~39.6s wall / `usage.latency_ms=37899`; warm `laya serve` HTTP round-trip (model loaded once at `serve` startup, kept warm) ~7.5-8.9s per `/v1/decide` call. Order-of-magnitude much slower than this project's LLM constrained-readout (<150ms) — flagged for Phase 7 performance-tuning awareness, not a blocker for Loop 5's wiring scope. | N/A (measured) | `time laya decide ...` + repeated `curl .../v1/decide` against warm `laya serve` (done, Loop 5) |
 
-**Phase 0 exit criteria:** 5 of 8 items resolved with evidence (1-5, all LLM/inference-path items — no guessing was needed, registry ids matched the documented fallbacks exactly). Items 6-8 (all Laya-specific) remain open, tracked for Loop 5+, not blocking the LLM-only work done through Loop 4.
+**Phase 0 exit criteria:** all 8 items now resolved with evidence. Items 1-5 (LLM/inference-path) resolved through Loop 4; items 6-8 (Laya-specific) resolved in Loop 5 via the corrected `laya serve` + HTTP-client understanding (see D_5).
 
 ## Architecture
 
@@ -166,7 +169,7 @@ See `workflows/documentation-management.md` and plan file `plans/20260922-2146-o
 
 **Abbreviated:**
 - `timing`: Timings struct only.
-- `models`: registry + hf-hub + ggmlc-run wrapper (merged, not separate crate).
+- `models`: registry + hf-hub + Laya HTTP client (`laya serve`, merged, not separate crate).
 - `engine`: GGUF load, LlamaContext, sample_greedy, reset_context.
 - `pipeline`: readout.rs, generate.rs, laya.rs submodules.
 - `apps/cli`, `apps/server`: fully separate binaries.
