@@ -38,8 +38,30 @@ reads, so Loop 2+ should cache-hit instantly):
 
 Total 4.8GB, server disk 265GB free after.
 
+## Runtime decision: Windows dev-build parity descoped (not a gate)
+
+G1 (Windows `cargo build --workspace` fails — missing libclang for `llama-cpp-sys-2` bindgen)
+is logged but **not blocking**. The user's Definition of Done is entirely about the Linux
+server (103.146.166.46) — that's the authoritative build/run target for every loop from here
+on. Windows is dev-convenience only. Decision (mechanical, Runtime call): from Loop 2 onward,
+`Runtime.check(A_t)` runs against the **Linux server** as the primary/required check; a
+Windows build attempt is opportunistic/best-effort, never blocking. Will revisit G1 with a
+cheap fix (install LLVM, set `LIBCLANG_PATH`) if a loop has spare capacity, not as a gate.
+
+## Reference material for later loops
+
+`plans/20260922-2146-openjev-rust-implementation/research/researcher-05-benchmark-usecases.md`
+— 14 real Jev/OpenJev/Laya use-case categories (email routing, jailbreak detection, invoice
+categorization, agent tool-routing, etc.), a reusable proxy eval-dataset list (InjecAgent, BEIR
+SciFact, SNIPS, Banking77, MetaTool, SkillRetBench, BFCL v3 — from a third-party ~22.5k-call
+Jev benchmark), and **10 concrete benchmark scenarios (prompt/options/category/rationale)**
+spanning easy→hard/adversarial. **Use these to replace the trivial "capital of France" example**
+once a loop builds the default test-scenario set for `apps/cli`/`apps/server` demos and
+Phase 7's tuning loop — not yet wired into any loop's Tasks, flagged here so it isn't lost.
+
 ## Loops
 
 | Loop | Status | D_t | A_t | E_t | gaps | regressions |
 |------|--------|-----|-----|-----|------|-------------|
-| 1 | in-progress | loop-01-dev-doc.md | (workspace + remote server) | — | — | — |
+| 1 | delivered | loop-01-dev-doc.md | (workspace + remote server, commit e098942) | loop-01-evidence.md | 8 | 0 |
+| 2 | delivered | loop-02-dev-doc.md | (workspace + remote server, real engine/models/pipeline, Qwen3-0.6B e2e via CLI) | loop-02-evidence.md | 3 new (G9/G10/G11), G3/G4/G5 closed | 0 |
