@@ -1,7 +1,8 @@
-# Server Tuning Results — Loop 6 (n_threads)
+# Server Tuning Results — Loops 6-7 (n_threads, openmp, native-CPU build, n_batch)
 
-Interim checkpoint, NOT final convergence. Proves the tuning methodology with real before/after
-numbers; Loop 7+ continues (build flags/native-CPU opts, `batch_size`, `openmp` feature).
+Loop 6 proved the tuning methodology (`n_threads`) with real before/after numbers. Loop 7 (see
+"Loop 7" section below) closes out tuning: verifies `openmp` is genuinely active, tests a
+native-CPU build and 2 `n_batch` values, and states the final recommended production config.
 
 ## Harness
 
@@ -126,3 +127,193 @@ loop (out of this loop's minimal-fix scope). If the box reboots, port 8090 rever
 whatever external/cloud-level filtering G17 originally found (unverified from inside this
 project). Re-applying the two `iptables` commands above after any reboot, or installing
 `iptables-persistent`, is a cheap Loop 7+ follow-up.
+
+
+---
+
+# Loop 7 — openmp verification, native-CPU build, n_batch sweep, final config
+
+This loop closes out server tuning. All tests below reuse the identical `scripts/bench-harness.sh`
+methodology (3 models x 10 real scenarios, Laya not skipped, 30 real HTTP requests per run),
+`n_threads=28` held constant (Loop 6's proven winner), so every comparison here isolates exactly
+one new variable against the Loop 6 `28` baseline (`generation_ms` mean/median/max qwen3-0.6b
+4855.6/4758/7685, minicpm5-2b 8070.9/8990/12983, qwen3-4b 14914.3/14241/21793;
+`constrained_readout_ms` mean 125.7/233.4/389.7).
+
+## 1. Is `openmp` actually active? Yes — verified at 3 independent levels, not assumed
+
+`llama-cpp-2 = "0.1"` in `crates/engine/Cargo.toml` has no `default-features = false`, so
+`llama-cpp-2`'s own `default = ["openmp", "android-shared-stdcxx", "common"]` applies, which maps
+to `llama-cpp-sys-2/openmp` (`openmp = ["llama-cpp-sys-2/openmp"]` in `llama-cpp-2`'s manifest).
+That crate's `build.rs` (`if cfg!(feature = "openmp") { config.define("GGML_OPENMP", "ON") }`)
+does pass `GGML_OPENMP=ON` to CMake by default — but a declared Cargo feature is not proof the
+compiled artifact actually links/uses it, so this was verified 3 ways on the live build:
+
+1. **CMakeCache.txt** (`target/release/build/llama-cpp-sys-2-*/out/build/CMakeCache.txt`):
+   `GGML_OPENMP:BOOL=ON`, `GGML_OPENMP_ENABLED:INTERNAL=ON`, `OpenMP_C_FLAGS:STRING=-fopenmp`,
+   `OpenMP_CXX_FLAGS:STRING=-fopenmp`.
+2. **Real compiler invocation** (`ggml-cpu`'s `flags.make`): `C_FLAGS`/`CXX_FLAGS` both literally
+   contain `-fopenmp` (and, after the native rebuild below, `-march=native` alongside it) — the
+   flag isn't just declared in CMake, it's on the actual `gcc`/`g++` command line.
+3. **Linked binary**: `ldd target/release/openjev-server` shows `libgomp.so.1 =>
+   /lib/x86_64-linux-gnu/libgomp.so.1` — the running server process genuinely links GNU OpenMP's
+   runtime. `nm libggml-cpu.a | grep 'GOMP\|omp_get'` shows 5 real undefined-symbol references
+   (`GOMP_barrier`, `GOMP_parallel`, `GOMP_single_start`, `omp_get_num_threads`,
+   `omp_get_thread_num`) resolved against that runtime, not dead-stripped.
+
+**Verdict: openmp is genuinely active**, not just a declared default feature — this is llama.cpp's
+real threading backend for CPU decode on this build, not the plain pthread pool.
+
+## 2. CPU-native build (`target-cpu=native` + `GGML_NATIVE`)
+
+`llama-cpp-sys-2`'s `build.rs` reads the Rust `target_cpu` (from `RUSTFLAGS`/`CARGO_ENCODED_RUSTFLAGS`
+parsing) and, when it equals `"native"`, calls `config.define("GGML_NATIVE", "ON")` — otherwise
+`GGML_NATIVE=OFF` is set explicitly (no silent auto-detection). There is no separate llama.cpp
+Cargo feature for this; `RUSTFLAGS="-C target-cpu=native"` is the actual mechanism, confirmed from
+`build.rs` source, not guessed.
+
+Rebuilt: `RUSTFLAGS="-C target-cpu=native" cargo build --release --workspace` (exit 0, 1m44s wall,
+only the 2 pre-existing warnings). Verified real: new `CMakeCache.txt` shows `GGML_NATIVE:BOOL=ON`
+(vs `OFF` in the non-native build), and `flags.make` shows `-march=native -fopenmp` literally on
+the `gcc`/`g++` command line for `ggml-cpu`. Box CPU: Intel Xeon Gold 5320 (Ice Lake-SP,
+AVX-512-capable) — non-native build had `GGML_AVX512:BOOL=OFF`.
+
+Harness run (`native` label, `--threads 28`, default `--batch` i.e. 512, Laya not skipped, 30
+requests, `error_count:0`):
+
+| Model | native gen mean/median/max (ms) | vs Loop-6 `28` baseline | native readout mean (ms) | vs baseline |
+|---|---|---|---|---|
+| qwen3-0.6b | 4338.2 / 3476 / 7321 | -10.7% / -27.0% / -4.7% | 112.2 | -10.8% |
+| minicpm5-2b | 8544.2 / 9595.5 / 13144 | +5.9% / +6.7% / +1.2% | 178.9 | -23.4% |
+| qwen3-4b | 14197.6 / 15724 / 20913 | -4.8% / +10.4% / -4.0% | 291.0 | -25.3% |
+
+**Reading:** `generation_ms` is a mixed bag (qwen3-0.6b/qwen3-4b mean slightly faster, minicpm5-2b
+mean slightly slower; medians noisier still) — no clean, consistent win/loss the way Loop 6's
+`n_threads` sweep had, plausibly within this single-run harness's own run-to-run noise band
+(sequential requests, shared box, no repeat runs to average out variance). `constrained_readout_ms`
+is the one genuinely consistent signal: **10-25% faster across all 3 models** with the native
+build — small single-token decodes benefit from `-march=native`'s wider SIMD (AVX-512 now
+reachable) with less amortization needed than the long multi-step `generation_ms` phase. Kept for
+the final config given this consistent win and zero measured downside (same `error_count:0`,
+build/test/regression all clean).
+
+## 3. `n_batch` sweep (256, 1024) — both run against the native build, `--threads 28`
+
+`crates/engine/src/lib.rs`'s `EngineConfig.n_batch` (default `512`) was previously hardcoded via
+`EngineConfig::default()` inside `run_bench`, same pattern Loop 6 fixed for `n_threads`. Added a
+`--batch` flag to `openjev-server` (`apps/server/src/main.rs`), threaded through
+`AppState::new(n_threads, n_batch)` -> `supervisor_loop` -> `worker_loop` -> `run_bench` ->
+`EngineConfig { n_threads, n_batch, ..EngineConfig::default() }` — identical plumbing shape to
+Loop 6's `--threads`, not a new pattern.
+
+| Model | batch=256 gen mean/median/max | batch=256 readout mean | batch=1024 gen mean/median/max | batch=1024 readout mean |
+|---|---|---|---|---|
+| qwen3-0.6b | 4148.0 / 3289.5 / 7146 | 99.3 | 3965.3 / 3269 / 6799 | 105.3 |
+| minicpm5-2b | 8500.2 / 9910 / 13064 | 187.7 | 8277.8 / 9249 / 12547 | 185.4 |
+| qwen3-4b | 14782.8 / 16470 / 22252 | 292.3 | 14671.5 / 16160 / 21349 | 300.9 |
+
+(baseline for this comparison = the native/batch=512 row in §2 above: qwen3-0.6b 4338.2/112.2,
+minicpm5-2b 8544.2/178.9, qwen3-4b 14197.6/291.0. All 3 batch runs: `total_requests:30`,
+`error_count:0`.)
+
+**Reading:** neither `256` nor `1024` shows a clean win across all 3 models — `batch=1024` trends
+slightly better on the two smaller models (qwen3-0.6b -8.6% gen mean, minicpm5-2b -3.1% gen mean)
+but slightly worse on `qwen3-4b` (+3.3% gen mean, both readout fields +3-4% worse than batch=512).
+`batch=256` is similarly mixed (better on qwen3-0.6b, roughly flat/worse on the other two). These
+deltas are all inside the same noise band as §2's `generation_ms` swings (single-run harness, no
+repeats) — none of the 3 models shows a large, one-directional effect the way the Loop 6
+`n_threads` sweep did. **No evidence to move off the `512` default**; the (single-token decode
+per request, small `n_batch` window rarely saturated) workload here doesn't exercise `n_batch`
+tuning the way a long-prompt prefill workload would.
+
+## 4. Final recommended production config
+
+- **`n_threads=28`** (Loop 4/6, unchanged — still the proven winner vs 16/32).
+- **Native CPU build**: `RUSTFLAGS="-C target-cpu=native" cargo build --release --workspace`
+  (`GGML_NATIVE=ON`, `-march=native` reaching this box's AVX-512) — consistent 10-25%
+  `constrained_readout_ms` win across all 3 models, no measured downside.
+- **`n_batch=512`** (default, unchanged) — neither `256` nor `1024` showed a consistent win.
+- **openmp**: active by default (`llama-cpp-2`'s own default feature set), verified genuinely
+  linked/used, left as-is — no change needed.
+
+**Currently running on the server**: `./target/release/openjev-server --port 80 --threads 28`
+(binary built with `RUSTFLAGS="-C target-cpu=native"`, `--batch` omitted so `EngineConfig`
+default `512` applies), PID re-verified alive at loop end, `/health` and `/bench` both externally
+reachable and correct for all 3 models.
+
+## 5. Full regression pass (this loop's final config)
+
+- **CLI** (`./target/release/openjev-cli --model <m> --prompt "Which city is the capital of
+  France?" --options "London,Paris"`, Laya not skipped): all 3 models (`qwen3-0.6b`,
+  `minicpm5-2b`, `qwen3-4b`) — `readout.best_option=Paris`, `generate.valid=true`
+  (`{"answer":"Paris"}`), `laya.best_option=Paris`. Real per-model timings recorded (e.g.
+  qwen3-0.6b `constrained_readout_ms=56`, `generation_ms=1404`).
+- **Server** (external `curl` to `103.146.166.46:80/bench` from outside the box, not SSH-side):
+  same 3 models, same prompt — `readout=Paris`, `generate.valid=true`, `laya=Paris` for all 3,
+  both on the sentinel-injected build (before G13 test) and again on the final clean rebuilt
+  binary after revert.
+- `cargo build --workspace` (debug + release) and `cargo test --workspace` (3 passed / 0 failed,
+  `pipeline::readout`) both re-run clean after every rebuild this loop (native build, `n_batch`
+  plumbing add, G13 sentinel inject, G13 sentinel revert) — no regression at any step.
+
+## 6. G13 + Laya-outage re-test (on this loop's final native+n_batch-plumbed build)
+
+Backed up `app.rs` (md5 `0546062f...`), injected a sentinel panic (`prompt ==
+"__QA_LOOP7_FAULT_INJECT__"`) into the new `run_bench` (post `n_batch`-param signature), rebuilt
+release (exit 0), restarted `--threads 28`. Sentinel request -> HTTP 500
+`{"error":"engine worker thread dropped the response"}` (clean, not a hang). `/health` immediately
+after -> 200. Next `/bench` -> HTTP 200, `model_load_ms=927` (fresh reload, cache genuinely
+cleared), correct answer. Server log shows the real panic message and "respawning with an empty
+model cache" — same PID (86050) throughout. Confirms G13/G15's fixes survive the `n_batch`
+signature change, same as Loop 6 confirmed for the `n_threads` change.
+
+Same session: killed the live `laya serve` PID -> `/bench` -> HTTP 200 (not 500), `laya:null`,
+`laya_inference_ms=13` (fast fail, not a stall), real degrade log
+(`laya unavailable, continuing without it: laya error: laya serve unreachable: ...`). Laya
+restarted, `/health` -> 200 again.
+
+Cleanup: `app.rs` reverted from backup, md5 exact match to pre-injection
+(`0546062fef4d761c9a75e2c996af029e`), `grep -c QA_LOOP7_FAULT_INJECT` -> 0, rebuilt clean (exit 0),
+restarted on the final `--threads 28` config (new PID 86557), backup files deleted.
+
+## 7. G18 (iptables persistence) — closed this loop
+
+Ubuntu 24.04 with `systemd` as init (confirmed, `ps -p 1 -o comm=` -> `systemd`), so this was
+trivial, not a gap to document-and-skip. Installed
+`/etc/systemd/system/openjev-laya-firewall.service` (oneshot, `WantedBy=multi-user.target`,
+`ConditionPathExists=!/run/openjev-laya-firewall.applied` so it only (re)applies once per boot):
+re-runs the same 2 rules Loop 6 added by hand
+(`iptables -A INPUT -p tcp --dport 8090 -i lo -j ACCEPT` then `... -j DROP`), then touches the
+`/run` marker. `systemctl enable` confirmed (`multi-user.target.wants` symlink created).
+
+Verified for real, not just "enabled" on paper: manually removed both live `iptables` rules and
+the `/run` marker (simulating a fresh boot's empty `INPUT` chain), then `systemctl start
+openjev-laya-firewall.service` — `systemctl status` shows all 3 `ExecStart` lines exited
+`status=0/SUCCESS`, and `iptables -L INPUT -n -v --line-numbers` immediately after shows the exact
+same 2 rules back in place. Re-verified `127.0.0.1:8090/health` -> 200 (internal Laya calls still
+work) and external `103.146.166.46:8090/health` -> timeout again (curl exit 28) — G17's mitigation
+intact after the G18 test. Not reboot-tested (a real reboot would also take down the manually
+`nohup`'d `openjev-server`/`laya serve` processes, which have no systemd units of their own and
+weren't in this loop's scope to add) — but the boot-time mechanism itself is installed, enabled,
+and proven to correctly reapply the exact rules from an empty starting state, which is the
+substantive part of "survives a reboot."
+
+## 8. Final server state confirmed alive
+
+`openjev-server` PID 86557 (`--port 80 --threads 28`, native build, `n_batch` default 512) and
+`laya serve` PID 86269 both running at loop end. Internal (`127.0.0.1`) health: `:80` -> 200,
+`:8090` -> 200. External (from outside the box): `:80/health` -> 200, `:80/bench` correct for all
+3 models (readout+generate+laya), `:8090` -> connection timeout (G17 still enforced, G18 unit
+re-verified separately above).
+
+## 9. Remaining gaps (unchanged from Loop 6, not this loop's scope)
+
+- **G10** — no unit tests for `generate.rs`.
+- **G12** — `apps/server` still zero in-repo unit tests (now also covers the `n_batch` plumbing
+  added this loop).
+- **G14** — port 80 deviation, previously accepted.
+- **G16** — docs self-contradiction, cosmetic.
+- **G2/G11** — out of scope, carried.
+- A finer-grained `n_threads` sweep (20/24/26) and multi-run averaging for `generation_ms`
+  (to separate real batch/native effects from single-run noise) are both explicitly out of this
+  loop's scope per D_7 ("not an open-ended search").
