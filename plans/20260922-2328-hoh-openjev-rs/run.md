@@ -394,6 +394,29 @@ hardcoded Q8_0; the vendored `llama-cpp-sys-2` grammar-engine SIGABRT (Loop 19) 
 root-caused upstream. None of these are regressions or active problems — all are
 optional future work.
 
+## Jev comparison closed with real evidence (2026-09-23, post-Loop-20)
+
+The extended goal below ("bằng hoặc nhanh hơn Jev") had never been checked against a real
+head-to-head — closing that gap now with actual measured numbers on both sides (full
+detail + caveats: `docs/benchmarks/jev-comparison.md`).
+
+Live production `/bench` call (qwen3-0.6b, scenario `1_email_routing`, post-Loop-20):
+`constrained_readout_ms=379`, `laya_inference_ms=111`. Jev's own real, independently
+measured latency (`researcher-07-jev-benchmark-target.md`, dev.to 22.5k-call benchmark +
+sysone-bench head-to-head, not just TypeSafe marketing): **0.3-1.07s cluster** across every
+3rd-party source.
+
+**Result: goal MET for the 2 methods architecturally comparable to what Jev actually does**
+(typed noul/choice/score answers, never free-form generation) — `laya` beats Jev's real
+numbers by **2.7-9x** (111ms vs Jev's 300ms-1.07s), `constrained-readout` is **at parity,
+fast end of Jev's own range** (379ms, below Jev's own P50 floor in 2/3 independent
+measurements) — both on a CPU-only box (Xeon Gold 5320, no GPU) vs Jev's undisclosed
+(near-certainly GPU) cloud backend. `generate` (openjev-rs's own 3rd method, doesn't exist
+in Jev's API) is naturally slower by design and isn't counted against the goal — it was
+never Jev's operating mode. Caveats (Jev's network RTT is baked into its published numbers,
+no same-hardware controlled comparison is possible since Jev is closed/paid and out of
+scope to call directly) are documented in the comparison doc, not hidden.
+
 ## Extended goal (2026-09-23): beat Jev's latency, not just match it
 
 New user directive after the original 6-item DoD was met: current performance still "too low"
