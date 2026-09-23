@@ -13,6 +13,14 @@ use serde_json::Value;
 // ~11-12 tok/s generation for Qwen3-4B, far below the K8s AMX pod's 30+ tok/s -- pushing the
 // cap that high would cost 60-90s+ of extra worst-case latency per request for little added
 // benefit once thinking is suppressed).
+//
+// Loop 19: this cap is now ALSO the real ceiling for `suppress_think: false` models
+// (currently only Qwen3-0.6B) generating natural, unsuppressed CoT -- if the model's
+// reasoning runs past 768 tokens without ever emitting valid JSON, generation stops here with
+// likely-invalid output. Real measured rate for Qwen3-0.6B under this policy: 7/10 valid JSON
+// (matches this model's pre-Loop-18 baseline exactly -- see
+// docs/benchmarks/generation-pipeline-tuning.md), 3 of the 10 scenarios genuinely run the
+// full 768 tokens without landing on `{"answer": ...}`.
 pub const MAX_TOKENS: usize = 768;
 
 #[derive(Debug, Clone, Serialize)]
@@ -87,13 +95,30 @@ pub fn parse_and_validate(text: &str, options: &[String]) -> Option<Value> {
 /// Greedy JSON generation (Decisions Locked #6): builds a chat-templated prompt asking the
 /// model to answer with `{"answer": "<option>"}`, greedy-samples up to `MAX_TOKENS` or an
 /// end-of-generation token, strips `<think>...</think>`, then parses+validates the result.
+///
+/// `suppress_think` selects the Loop 19 per-model generation policy (from
+/// `models::ModelEntry::suppress_think`, plumbed through by the caller):
+/// - `true` (Qwen3-4B, MiniCPM5-2B): Loop 18's behavior, unchanged -- seed a closed, empty
+///   `<think>\n\n</think>\n\n` right after the chat-templated prompt so the model never emits
+///   visible reasoning at all. Proven net win (10/10 valid JSON, improved correctness) for
+///   both models; kept as-is.
+/// - `false` (Qwen3-0.6B): Loop 19's fix -- let the model reason naturally (no seed), since
+///   Loop 18 found this model's correctness depends on visible CoT (forcing it closed dropped
+///   correct-answer count 5/9 -> 3/9). Recovers correctness to 5/9 (matching the pre-Loop-18
+///   baseline) at the honest cost of JSON validity also reverting to that same pre-Loop-18
+///   baseline (7/10, down from Loop 18's 10/10 for this model) -- see
+///   `docs/benchmarks/generation-pipeline-tuning.md` for why grammar-constrained decoding
+///   (which would have recovered the JSON-validity win without this trade-off) was prototyped
+///   and rejected: it crashes this project's vendored llama.cpp build.
 pub fn run_generate(
     engine: &mut Engine,
     prompt: &str,
     options: &[String],
+    suppress_think: bool,
 ) -> Result<GenerateResult, PipelineError> {
     let mut _s = timing::perf_span!("pipeline::run_generate");
     _s.set("n_options", options.len().to_string());
+    _s.set("suppress_think", suppress_think.to_string());
     let options_list = options.join(", ");
     let full_prompt = format!(
         "{prompt}\nOptions: {options_list}\nRespond with ONLY a JSON object of the exact form \
@@ -102,20 +127,27 @@ pub fn run_generate(
     let chat_prompt = engine
         .apply_chat_template(&full_prompt)
         .map_err(|e| PipelineError::Engine(e.to_string()))?;
-    // Loop 18 MAX_TOKENS-truncation fix. `engine::apply_chat_template` renders via
-    // llama.cpp's built-in `llama_chat_apply_template` (a fixed-format C++ matcher over the
-    // messages, confirmed by reading `llama-cpp-2::model::apply_chat_template`'s source), NOT
-    // a real Jinja engine -- so the GGUF's embedded chat template's `{% if enable_thinking is
-    // false %}{{- '<think>\n\n</think>\n\n' }}{% endif %}` branch (confirmed present, byte for
-    // byte identical, in both Qwen3-4B's and MiniCPM5-2B's `tokenizer.chat_template` GGUF
-    // metadata) never executes here; there is no `enable_thinking` kwarg to pass through this
-    // binding. Appending that exact literal text ourselves right after the assistant turn
-    // reproduces what the real template would render for `enable_thinking=False` -- this is
-    // the documented community workaround for chat-template engines that can't run arbitrary
-    // Jinja. It is inert prompt-conditioning text (never generated, so it costs zero tokens)
-    // that tells the model its reasoning block is already closed/empty, which in practice
-    // suppresses `<think>...</think>` generation entirely instead of just capping it.
-    let chat_prompt = format!("{chat_prompt}<think>\n\n</think>\n\n");
+    // Loop 18 MAX_TOKENS-truncation fix, now conditional on the per-model policy (Loop 19).
+    // `engine::apply_chat_template` renders via llama.cpp's built-in `llama_chat_apply_template`
+    // (a fixed-format C++ matcher over the messages, confirmed by reading
+    // `llama-cpp-2::model::apply_chat_template`'s source), NOT a real Jinja engine -- so the
+    // GGUF's embedded chat template's `{% if enable_thinking is false %}{{- '<think>\n\n</think>
+    // \n\n' }}{% endif %}` branch (confirmed present, byte for byte identical, in both
+    // Qwen3-4B's and MiniCPM5-2B's `tokenizer.chat_template` GGUF metadata) never executes
+    // here; there is no `enable_thinking` kwarg to pass through this binding. Appending that
+    // exact literal text ourselves right after the assistant turn reproduces what the real
+    // template would render for `enable_thinking=False` -- this is the documented community
+    // workaround for chat-template engines that can't run arbitrary Jinja. It is inert prompt
+    // -conditioning text (never generated, so it costs zero tokens) that tells the model its
+    // reasoning block is already closed/empty, which in practice suppresses
+    // `<think>...</think>` generation entirely instead of just capping it. Only applied when
+    // `suppress_think` is true (Qwen3-4B, MiniCPM5-2B); Qwen3-0.6B (`suppress_think: false`)
+    // gets the unmodified chat-templated prompt and reasons naturally.
+    let chat_prompt = if suppress_think {
+        format!("{chat_prompt}<think>\n\n</think>\n\n")
+    } else {
+        chat_prompt
+    };
 
     let tokens = engine
         .tokenize(&chat_prompt)

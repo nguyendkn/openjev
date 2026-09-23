@@ -281,6 +281,64 @@ Uncommitted at handback: `crates/pipeline/src/generate.rs`, `crates/models/src/
 download.rs`, new `apps/server/src/bin/quant_bench.rs`, updated
 `quantization-sweep-results.md` — Runtime to commit after recording this loop.
 
+**Loop 19 (delivered, DEPLOYED, honest no-free-lunch result): fixed Qwen3-0.6B's
+correctness regression from Loop 18; grammar-constrained decoding tried and correctly
+rejected (crashes the server).** Runtime-verified independently (SSH: `systemctl
+is-active` all 3 services = active, `/health` = 200, registry has `suppress_think` field
+with the reported true/false split, backup md5s match the chain — Loop 19's pre-backup
+md5 equals Loop 18's deployed-binary md5, confirming production was genuinely untouched
+between loops, not just claimed).
+
+- **Root cause confirmed** (Task 1): reverting ONLY the `<think></think>` force-close
+  (holding MAX_TOKENS=768 constant) recovers Qwen3-0.6B 3/9→5/9 exactly — isolates the
+  force-close itself as the cause, not the cap raise or scenario noise.
+- **GBNF grammar-constrained decoding: prototyped, found UNSAFE, rejected** (Task 2) —
+  not shipped, correctly so. It reproducibly **crashed the whole server process**
+  (SIGABRT — `GGML_ASSERT(!stacks.empty())` inside the vendored `llama-cpp-sys-2 0.1.156`
+  C++ grammar engine, NOT a catchable Rust panic, so G13's `catch_unwind` supervisor does
+  NOT protect against it). 2 real bugs were found and fixed in the prototype along the
+  way (a C++ trigger-scanner abort on long spans, a logits-index off-by-one) but a third
+  assert persisted even in the simplest case — root cause is inside the vendored C++
+  library, out of scope to patch this loop; all grammar code was fully removed from the
+  shipped tree before deploy (verified clean, zero dead code).
+- **Final shipped approach** (Task 3): pure per-model policy, no grammar. New
+  `ModelEntry::suppress_think: bool` field — kept `true` (Loop 18's fix) for Qwen3-4B/
+  MiniCPM5-2B where it was a proven net win, reverted to `false` (natural CoT) for
+  Qwen3-0.6B.
+- **Real before/after, all 3 models, 10 scenarios** (Task 4): Qwen3-4B and
+  MiniCPM5-2B — byte-identical to Loop 18 (10/10 valid, correctness unchanged), no
+  regression. Qwen3-0.6B — valid-JSON 10/10→**7/10** (an honest regression back to its
+  own pre-Loop-18 level) but correctness recovered 3/9→**5/9**; mean `generation_ms`
+  632ms→**7,133ms** (~11x slower — natural CoT is genuinely expensive on this model).
+  **No simultaneous win on all 3 axes (validity + correctness + speed) was achievable
+  for Qwen3-0.6B** — reported as the real trade-off, not glossed over.
+- **Deployed** (Task 5) with full backup/rollback (md5-verified chain).
+- **2 secondary flips investigated** (Task 6, not fixed — the tool that might have
+  helped, grammar-constraining, is rejected): Qwen3-4B `2_jailbreak_detection` — both
+  constrained-readout (99.99996% confidence) AND generate agree with each other and
+  disagree with the documented expected label — likely a mislabeled test case, not a
+  bug. MiniCPM5-2B `9_compliance_gating` — a genuine readout-vs-generate divergence
+  (readout 90.98% "yes" matches expected, generate says "no") — real, unresolved,
+  flagged for a future architectural look (e.g. prefer readout when methods strongly
+  disagree).
+- **Full regression clean** (Task 7), including finally completing the Laya-outage
+  **live drill** Loop 18 couldn't do (stopped `laya serve` for real, confirmed `/bench`
+  degrades gracefully to `laya: null` with 200, restarted, recovered within 3s) — this
+  closes Loop 18's open gap #3. G13 drilled on an isolated scratch copy (never the live
+  artifact). G17/G18 firewall intact.
+- Doc: new `docs/benchmarks/generation-pipeline-tuning.md`.
+
+**Open gaps carried forward**: (1) Qwen3-0.6B's ~7.1s mean latency under natural CoT is
+now the slowest of the 3 models, unmitigated — a bounded partial-CoT budget (the
+"NOWAIT"-style technique flagged in `docs/research/cpu-inference-optimization-2026.md`)
+was NOT attempted this loop (Task 3 chose the simpler binary policy) and remains a real
+next lever; (2) the grammar-engine SIGABRT is worth root-causing upstream (possible
+`llama-cpp-2`/`llama.cpp` version issue) since it would recover Qwen3-0.6B's JSON
+validity without the correctness trade-off if fixed; (3) MiniCPM5-2B's
+`compliance_gating` readout-vs-generate divergence; (4) Qwen3-4B's `jailbreak_detection`
+flip is likely a mislabeled expected-answer, not a code bug — low priority to chase
+further. Uncommitted at handback: 7 source files + 1 new doc — Runtime to commit.
+
 ## Extended goal (2026-09-23): beat Jev's latency, not just match it
 
 New user directive after the original 6-item DoD was met: current performance still "too low"

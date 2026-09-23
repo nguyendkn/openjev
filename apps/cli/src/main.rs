@@ -101,7 +101,7 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
 
     // 6. Greedy JSON generation.
     let t0 = Instant::now();
-    let generate = run_generate(&mut engine, &cli.prompt, &cli.options)?;
+    let generate = run_generate(&mut engine, &cli.prompt, &cli.options, entry.suppress_think)?;
     timings.generation_ms = t0.elapsed().as_millis();
 
     // 7. Laya (3rd comparison method): calls the separately-running `laya serve` process.

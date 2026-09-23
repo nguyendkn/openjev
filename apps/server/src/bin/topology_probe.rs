@@ -31,6 +31,7 @@ fn opts() -> Vec<String> {
 fn spawn_worker(
     model_path: PathBuf,
     n_threads: i32,
+    suppress_think: bool,
 ) -> (mpsc::Sender<Job>, std::thread::JoinHandle<()>) {
     let (tx, rx) = mpsc::channel::<Job>();
     let handle = std::thread::spawn(move || {
@@ -51,7 +52,7 @@ fn spawn_worker(
             let _ = engine.tokenize(PROMPT).expect("tokenize");
             let _ = run_readout(&mut engine, PROMPT, &options).expect("readout");
             engine.reset_context();
-            let _ = run_generate(&mut engine, PROMPT, &options).expect("generate");
+            let _ = run_generate(&mut engine, PROMPT, &options, suppress_think).expect("generate");
             let _ = job.done.send(t0.elapsed().as_millis());
         }
     });
@@ -100,7 +101,7 @@ fn main() {
         let mut senders = Vec::with_capacity(n_workers);
         let mut handles = Vec::with_capacity(n_workers);
         for _ in 0..n_workers {
-            let (tx, h) = spawn_worker(model_path.clone(), n_threads);
+            let (tx, h) = spawn_worker(model_path.clone(), n_threads, entry.suppress_think);
             senders.push(tx);
             handles.push(h);
         }

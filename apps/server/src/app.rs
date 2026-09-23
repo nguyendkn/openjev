@@ -194,10 +194,14 @@ pub(crate) fn run_bench(
 
     let mut timings = Timings::default();
 
+    // Hoisted above the cache check (Loop 19): `run_generate` below needs
+    // `entry.suppress_think` regardless of whether this is a cache hit or miss, whereas
+    // before Loop 19 only the cache-miss branch needed `entry` at all.
+    let entry = models::find(&req.model)?;
+
     if !engines.contains_key(&req.model) {
         let _s = timing::perf_span!("server::ensure_model_loaded");
         let t0 = Instant::now();
-        let entry = models::find(&req.model)?;
         let model_path = models::ensure_downloaded(entry)?;
         let engine_config = EngineConfig {
             n_threads,
@@ -216,9 +220,6 @@ pub(crate) fn run_bench(
         timings.warmup_ms = t0.elapsed().as_millis();
 
         engines.insert(req.model.clone(), engine);
-    } else {
-        // Model already cached: no model-load/warmup timing charged to this request.
-        let _ = models::find(&req.model)?; // still validate the id even on cache hit
     }
 
     let engine = engines
@@ -244,7 +245,7 @@ pub(crate) fn run_bench(
     engine.reset_context();
 
     let t0 = Instant::now();
-    let generate = run_generate(engine, &req.prompt, &req.options)?;
+    let generate = run_generate(engine, &req.prompt, &req.options, entry.suppress_think)?;
     timings.generation_ms = t0.elapsed().as_millis();
 
     // Laya (3rd comparison method): calls the separately-running `laya serve` process (see

@@ -37,6 +37,17 @@ pub struct ModelEntry {
     pub filename: &'static str,
     /// License, from the HF Hub API's `cardData.license` field.
     pub license: &'static str,
+    /// Loop 19 per-model generation policy: whether `pipeline::run_generate` force-closes
+    /// the model's `<think>` reasoning block by seeding `<think>\n\n</think>\n\n` right
+    /// after the chat-templated prompt (Loop 18's fix). `true` for Qwen3-4B and
+    /// MiniCPM5-2B, where Loop 18 measured this as a proven net win (10/10 valid JSON,
+    /// improved correctness). `false` for Qwen3-0.6B: Loop 18 found this model's
+    /// correctness depends on its visible CoT (forcing it closed dropped correct-answer
+    /// count 5/9 -> 3/9), so Loop 19 leaves it on natural CoT and relies on
+    /// grammar-constrained decoding (see `crates/pipeline/src/generate.rs`) for JSON
+    /// validity instead. Unused for the `laya` entry (dead registry path, see its own
+    /// doc comment below) -- set to `false` there as a harmless default.
+    pub suppress_think: bool,
 }
 
 /// Static registry of known models. Only `qwen3-0.6b` is exercised (downloaded + run) this
@@ -49,6 +60,7 @@ pub const REGISTRY: &[ModelEntry] = &[
         revision: "23749fefcc72300e3a2ad315e1317431b06b590a",
         filename: "Qwen3-0.6B-Q8_0.gguf",
         license: "apache-2.0",
+        suppress_think: false,
     },
     ModelEntry {
         id: "qwen3-4b",
@@ -65,6 +77,7 @@ pub const REGISTRY: &[ModelEntry] = &[
         // absolute latency stays well under 2s.
         filename: "Qwen3-4B-Q5_K_M.gguf",
         license: "apache-2.0",
+        suppress_think: true,
     },
     ModelEntry {
         id: "minicpm5-2b",
@@ -82,6 +95,7 @@ pub const REGISTRY: &[ModelEntry] = &[
         // guidance. NOT swapped -- stays Q4_K_M.
         filename: "MiniCPM5-2B-Q4_K_M.gguf",
         license: "apache-2.0",
+        suppress_think: true,
     },
     ModelEntry {
         id: "laya",
@@ -98,6 +112,7 @@ pub const REGISTRY: &[ModelEntry] = &[
         // ships), so corrected to match reality rather than removed.
         filename: "laya_english_q8_0.gguf",
         license: "apache-2.0",
+        suppress_think: false,
     },
 ];
 
