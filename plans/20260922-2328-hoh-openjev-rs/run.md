@@ -292,11 +292,74 @@ G17, G18, 3 models × 3 methods) all re-verified clean. Per explicit user correc
 
 **User directive (new)**: investigate underutilized RAM/SSD — currently a single request
 saturates ~28/32 CPU cores via one serialized worker thread while 62GB RAM sits mostly idle.
-Research spawned in parallel (`researcher-11-resource-utilization.md`, in progress) covering:
+Research spawned in parallel (`researcher-11-resource-utilization.md`, complete) covering:
 multi-worker pool (trade single-request latency for concurrent throughput), `mmap`-based model
-loading (share read-only pages across workers via OS page cache instead of duplicating RAM),
-request batching, and whether `n_threads=28` (latency-optimal for Loop 6's single-request
-tuning) is still optimal under concurrent multi-request load.
+loading (already enabled by default, no work needed), request batching (high-effort/uncertain,
+deferred), SSD (not the bottleneck, skipped). Recommendation: multi-worker pool, benchmark
+topology empirically first — Loop 14 implementing.
+
+**Loop 13 (in progress): pushing `crates/laya-native` past the 92.7ms C++ baseline**, using
+the Loop 11b perf logger to find real hotspots. Also now carrying the temperature-clamp
+correctness fix from Loop 15's finding (see below).
+
+**Loop 14 (in progress): multi-worker pool for `apps/server`** — empirical topology
+benchmarking (N workers × T threads) before implementation, consistent-hash routing so the
+same model always lands on the same worker (bounded RAM use), G13-style per-worker panic
+supervision preserved. Also carrying the `model=laya` 400-vs-500 error fix (real bug found
+independently — the internal-only `laya` registry entry was selectable via the public `model`
+field and crashed with a confusing 500 instead of a clean 400).
+
+**User directive (new): GPU access granted on company K8s cluster** (context
+`fke-ncp-modas-stg-qc8ifaxe`, namespace `llms-lab`, provisioned this session to 32 CPU/128Gi
+RAM/1× H100 — quota raised via `kubectl`, permission added to `.claude/settings.local.json`,
+gitignored). Explicit scope: GPU is for MODEL-side optimization/validation only, the deployed
+engine stays CPU-only — this is not a scope change to the CPU-only architecture decision.
+
+**Loop 15 (delivered): GPU ground-truth generation — validates `-O3`, reverses part of Loop
+11.** Ran the REAL unquantized PyTorch `DecisionModel` (`github.com/NandhaKishorM/laya` +
+`convaiinnovations/laya` weights, verified 421,293,827 params) on a real H100 for all 10
+project benchmark scenarios + the reference case + 4 option-count edge cases (k=11/17/20/2).
+Deterministic across repeated runs, tokenizer independently cross-checked against
+`laya serve`'s own reported token count (28, exact match).
+- **`-O3` confirmed correct, independently**: mean absolute probability error vs ground truth
+  is 0.008 for `-O3` vs 0.0096 for `-O0` — and on the one scenario where they disagree, `-O3` is
+  8.7x closer (0.0020 vs 0.0174) and within 0.0005 of PyTorch's own shipped bf16 path. Loop 12's
+  choice to deploy `-O3` is now validated against an independent reference, not just against
+  another C++ build.
+- **Loop 11's temperature-clamp "fix" reversed**: the original Python (`laya/common.py`)
+  deliberately clamps calibration temperature to `[0.5, 5.0]` — with an explicit code comment
+  and a `RuntimeWarning` fired at runtime — specifically to prevent an ill-fitted temperature
+  (`choice:11+` bucket = 0.1006) from reporting false near-certainty (a real ~0.24 top
+  probability would be published as ~0.99 confidence unclamped). Loop 11 removed this clamp to
+  match `ggmlc`'s raw (unclamped) behavior — but `ggmlc` itself diverges from the original
+  design intent here, not `laya-native`. **User decision (2026-09-23, via AskUserQuestion):
+  restore the `[0.5, 5.0]` clamp, matching original design intent over `ggmlc` bit-parity** —
+  relayed to Loop 13 (currently working in the same crate) to apply alongside its speed work.
+  Only affects confidence/probability for k≥11 option questions — never changes which option
+  wins, confirmed across all edge cases.
+- **Quantization exploration (Task 8)**: weight-only fake-quantization tested across 122
+  Linear layers / 363.3M params. Q8_0 (current, block-32) is already near-optimal — 15/15
+  scenarios keep the correct choice, 0.0035 mean drift, actually beats per-channel int8
+  (0.0072 drift, coarser blocks). All 3 tested INT4-class schemes (q4_grp128, q4_0_blk32,
+  int4_chan) FLIP the correct answer on real scenarios (jailbreak detection, compliance
+  gating) — 1-2 orders of magnitude worse than the entire gap this investigation is about. **No
+  further quantization win exists** — don't pursue INT4 for Laya.
+- Reference file: `docs/benchmarks/pytorch-ground-truth-reference.md` (full 15-scenario data,
+  both temperature policies, bf16+fp32, provenance-labeled).
+- All K8s resources cleaned up (pod + HF-token secret deleted, quota usage back to 0/32 CPU,
+  0/128Gi, 0/1 GPU) — namespace left as provisioned (32 CPU/128Gi/1 GPU) for future use.
+- Gaps: `laya-native`'s own per-scenario probabilities were never persisted to the repo by
+  Loop 11 (only prose), so no true independent 4th column exists yet in the comparison table —
+  a cheap follow-up would run `LAYA_CASE` over all 15 scenarios and record them.
+
+**Operational note**: during Loops 13-15 running concurrently, production briefly became
+unresponsive twice (load average 40-52, then again during Loop 14's own concurrent-request
+validation) — diagnosed both times as contention from the session's own benchmark/probe
+processes, not a code regression. First incident: renice + SIGSTOP applied directly to
+`topology_probe`/`laya-native-probe` to restore responsiveness. Second incident: Loop 14 was
+messaged to confirm its own load test wasn't a deadlock and to bound test duration. Lesson for
+future loops: heavy CPU benchmarking against the live production server needs explicit time-
+boxing or off-peak scheduling, not unbounded concurrent runs.
 
 **User directive (overrides any "stop investing in Rust" framing)**: keep developing and
 optimizing `crates/laya-native`. The 95.1ms vs 92.7ms (~3% slower than fixed C++) result is a
