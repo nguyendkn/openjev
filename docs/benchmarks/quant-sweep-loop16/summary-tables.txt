@@ -1,0 +1,86 @@
+################ LLM SWEEP (10 project benchmark scenarios) ################
+
+=== qwen3-0.6b ===  (fidelity reference for agreement column: f16)
+variant             sizeGB validJS    vs_ref    vs_exp  tg_tok/s  pp_tok/s   wall_ms
+q8_0_official         0.64    8/10      6/10       5/9    164.49      1580      2064
+q4_k_m                0.48    7/10      7/10       4/9    149.88      2190      2542
+q5_k_m                0.55    9/10      5/10       3/9    131.28      2139      1824
+q6_k                  0.62    9/10      6/10       4/9    128.75      1800      2656
+q8_0_local            0.80    7/10      6/10       6/9    170.28      2379      2315
+f16                   1.51    9/10      9/10       5/9     85.83       994      3476
+  per-scenario answers:
+    1_email_routing | q8_0_official=billing  q4_k_m=billing  q5_k_m=billing  q6_k=billing  q8_0_local=billing  f16=billing
+    2_jailbreak_detection | q8_0_official=injection-attempt  q4_k_m=ambiguous  q5_k_m=ambiguous  q6_k=ambiguous  q8_0_local=injection-attempt  f16=ambiguous
+    3_invoice_categorization | q8_0_official=infrastructure  q4_k_m=infrastructure  q5_k_m=infrastructure  q6_k=infrastructure  q8_0_local=infrastructure  f16=infrastructure
+    4_agent_tool_routing | q8_0_official=None  q4_k_m=None  q5_k_m=file-convert  q6_k=file-convert  q8_0_local=None  f16=None
+    5_incident_severity | q8_0_official=sev3  q4_k_m=sev3  q5_k_m=sev4  q6_k=sev4  q8_0_local=None  f16=sev3
+    6_content_moderation | q8_0_official=flag-for-review  q4_k_m=None  q5_k_m=remove  q6_k=flag-for-review  q8_0_local=flag-for-review  f16=flag-for-review
+    7_support_sentiment_routing | q8_0_official=technical  q4_k_m=billing  q5_k_m=technical  q6_k=technical  q8_0_local=billing  f16=billing
+    8_adversarial_ambiguity | q8_0_official=None  q4_k_m=None  q5_k_m=None  q6_k=None  q8_0_local=None  f16=payment-issues
+    9_compliance_gating | q8_0_official=yes  q4_k_m=yes  q5_k_m=yes  q6_k=yes  q8_0_local=yes  f16=yes
+    10_loan_credit_risk | q8_0_official=deny  q4_k_m=deny  q5_k_m=deny  q6_k=deny  q8_0_local=deny  f16=deny
+
+=== minicpm5-2b ===  (fidelity reference for agreement column: f16)
+variant             sizeGB validJS    vs_ref    vs_exp  tg_tok/s  pp_tok/s   wall_ms
+q4_k_m_official       1.56    9/10      6/10       7/9     52.04       609      5292
+q5_k_m                1.81    9/10      8/10       7/9     41.57       657      5695
+q6_k                  2.07   10/10      7/10       6/9     40.96       426      5896
+q8_0_official         2.68    8/10      7/10       5/9     55.47       677      4633
+f16                   5.04    8/10      8/10       6/9     28.02       267      9279
+  per-scenario answers:
+    1_email_routing | q4_k_m_official=billing  q5_k_m=billing  q6_k=billing  q8_0_official=billing  f16=billing
+    2_jailbreak_detection | q4_k_m_official=ambiguous  q5_k_m=injection-attempt  q6_k=ambiguous  q8_0_official=ambiguous  f16=injection-attempt
+    3_invoice_categorization | q4_k_m_official=infrastructure  q5_k_m=infrastructure  q6_k=infrastructure  q8_0_official=infrastructure  f16=infrastructure
+    4_agent_tool_routing | q4_k_m_official=None  q5_k_m=None  q6_k=file-convert  q8_0_official=None  f16=None
+    5_incident_severity | q4_k_m_official=sev1  q5_k_m=sev1  q6_k=sev1  q8_0_official=sev1  f16=sev1
+    6_content_moderation | q4_k_m_official=flag-for-review  q5_k_m=remove  q6_k=remove  q8_0_official=remove  f16=remove
+    7_support_sentiment_routing | q4_k_m_official=billing  q5_k_m=billing  q6_k=billing  q8_0_official=billing  f16=billing
+    8_adversarial_ambiguity | q4_k_m_official=billing-disputes  q5_k_m=billing-disputes  q6_k=billing-disputes  q8_0_official=billing-disputes  f16=billing-disputes
+    9_compliance_gating | q4_k_m_official=yes  q5_k_m=yes  q6_k=yes  q8_0_official=yes  f16=yes
+    10_loan_credit_risk | q4_k_m_official=approve-with-conditions  q5_k_m=approve-with-conditions  q6_k=approve-with-conditions  q8_0_official=None  f16=None
+
+=== qwen3-4b ===  (fidelity reference for agreement column: q8_0_official)
+variant             sizeGB validJS    vs_ref    vs_exp  tg_tok/s  pp_tok/s   wall_ms
+q4_k_m_official       2.50    7/10      4/10       7/9     31.81       343     10640
+q5_k_m_official       2.89    6/10      5/10       4/9     24.16       314     15098
+q6_k_official         3.31    5/10      4/10       4/9     25.03       299     15987
+q8_0_official         4.28    5/10      5/10       4/9     29.59       342     11886
+  per-scenario answers:
+    1_email_routing | q4_k_m_official=billing  q5_k_m_official=billing  q6_k_official=billing  q8_0_official=billing
+    2_jailbreak_detection | q4_k_m_official=injection-attempt  q5_k_m_official=None  q6_k_official=None  q8_0_official=None
+    3_invoice_categorization | q4_k_m_official=infrastructure  q5_k_m_official=infrastructure  q6_k_official=infrastructure  q8_0_official=infrastructure
+    4_agent_tool_routing | q4_k_m_official=None  q5_k_m_official=file-convert  q6_k_official=None  q8_0_official=None
+    5_incident_severity | q4_k_m_official=sev1  q5_k_m_official=None  q6_k_official=None  q8_0_official=None
+    6_content_moderation | q4_k_m_official=flag-for-review  q5_k_m_official=ban-user  q6_k_official=remove  q8_0_official=ban-user
+    7_support_sentiment_routing | q4_k_m_official=billing  q5_k_m_official=billing  q6_k_official=billing  q8_0_official=billing
+    8_adversarial_ambiguity | q4_k_m_official=None  q5_k_m_official=None  q6_k_official=None  q8_0_official=None
+    9_compliance_gating | q4_k_m_official=yes  q5_k_m_official=yes  q6_k_official=yes  q8_0_official=yes
+    10_loan_credit_risk | q4_k_m_official=None  q5_k_m_official=None  q6_k_official=None  q8_0_official=None
+
+
+################ LAYA (15 PyTorch ground-truth scenarios) ################
+
+--- laya-hf.json ---
+variant           sizeMB  gt_choice  mean_d_top  max_d_top     lat_ms
+hf_f16               846      15/15    0.000618   0.004395      61.37
+hf_q8_0              452      15/15    0.004221   0.024990      67.40
+hf_ud_q4_k_m         420      14/15    0.051252   0.227537      68.81
+      FLIP 2_jailbreak_detection: got injection-attempt, gt benign
+  intra-set agreement vs hf_f16:
+    hf_f16           15/15
+    hf_q8_0          15/15
+    hf_ud_q4_k_m     14/15
+
+--- laya.json ---
+variant           sizeMB  gt_choice  mean_d_top  max_d_top     lat_ms
+comp_q8_0            452      14/15    0.071628   1.000000      67.61
+      FLIP E2_17opt_g21_over16: got other, gt order-cancellation
+comp_q4_k_m          346      14/15    0.059688   0.365805      68.54
+      FLIP 4_agent_tool_routing: got file-convert, gt email-send
+comp_q4_0            241      13/15    0.089731   0.491237      71.97
+      FLIP 9_compliance_gating: got yes, gt no
+      FLIP E4_2opt_binary_risk: got safe, gt unsafe
+  intra-set agreement vs comp_q8_0:
+    comp_q8_0        15/15
+    comp_q4_k_m      13/15
+    comp_q4_0        12/15

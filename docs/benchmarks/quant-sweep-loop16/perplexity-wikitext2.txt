@@ -1,0 +1,30 @@
+##MODEL Qwen3-0.6B-Q8_0
+1.00.420.141 I Final estimate: PPL = 22.5774 +/- 0.43051
+##MODEL Qwen3-0.6B-mk-Q4_K_M
+1.01.646.931 I Final estimate: PPL = 24.4901 +/- 0.47395
+##MODEL Qwen3-0.6B-mk-Q5_K_M
+1.18.789.123 I Final estimate: PPL = 23.4267 +/- 0.45280
+##MODEL Qwen3-0.6B-mk-Q6_K
+1.12.197.082 I Final estimate: PPL = 22.5521 +/- 0.43113
+##MODEL Qwen3-0.6B-mk-Q8_0
+0.46.144.076 I Final estimate: PPL = 22.5322 +/- 0.42982
+##MODEL Qwen3-0.6B-F16
+1.27.990.692 I Final estimate: PPL = 22.5220 +/- 0.43016
+##MODEL MiniCPM5-2B-Q4_K_M
+1.51.717.646 I Final estimate: PPL = 16.1048 +/- 0.28029
+##MODEL MiniCPM5-2B-mk-Q5_K_M
+1.59.146.860 I Final estimate: PPL = 15.4738 +/- 0.26813
+##MODEL MiniCPM5-2B-mk-Q6_K
+2.29.339.278 I Final estimate: PPL = 15.3420 +/- 0.26468
+##MODEL MiniCPM5-2B-Q8_0
+1.57.586.749 I Final estimate: PPL = 15.3075 +/- 0.26463
+##MODEL MiniCPM5-2B-F16
+4.45.055.334 I Final estimate: PPL = 15.2977 +/- 0.26452
+##MODEL Qwen3-4B-Q4_K_M
+2.56.170.175 I Final estimate: PPL = 16.9020 +/- 0.35190
+##MODEL Qwen3-4B-Q5_K_M
+3.09.833.287 I Final estimate: PPL = 14.6671 +/- 0.29150
+##MODEL Qwen3-4B-Q6_K
+4.05.854.501 I Final estimate: PPL = 14.7191 +/- 0.29433
+##MODEL Qwen3-4B-Q8_0
+3.15.108.764 I Final estimate: PPL = 14.6658 +/- 0.29350

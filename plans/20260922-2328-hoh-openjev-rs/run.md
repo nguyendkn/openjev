@@ -185,6 +185,40 @@ via checksum (no git on the server); a ready-to-apply patch is parked at `/tmp/l
 on the server if ever reconsidered, but not applied. Full regression (G13 per-worker,
 Laya-outage, G17/G18, 3 models × 3 methods) confirmed clean on the untouched production stack.
 
+**Loop 16 (delivered, K8s model-side, real GGUF quant sweep): 3 changes recommended,
+1 blocked, 2 real pipeline bugs surfaced as side-findings.** Ran on a 24vCPU K8s pod
+(Sapphire Rapids w/ AMX-INT8 — differs from production's Ice Lake, no AMX; explicit
+caveat throughout) — no production contact. Built REAL quant variants (not Loop 15's
+naive simulation): llama.cpp `llama-quantize` for the 3 LLMs, `ggmlc`'s quantizer for
+Laya. **Structural finding**: Laya/`ggmlc` has no true K-quant kernel — its "Q4_K_M"
+label is a mixed-precision policy over {F32,F16,Q8_0,Q4_0} blocks only (verified via
+GGUF tensor-type histogram), so Loop 15's simulation (predicting q4_0-class accuracy,
+not real K-quant) was actually the right comparison — and its prediction of 12/15
+scenario-agreement, including WHICH scenario class flips (compliance/safety gating),
+matched the real q4_0 test exactly. **Recommendations** (perplexity/agreement +
+speed, K8s pod numbers): Qwen3-0.6B **keep Q8_0** (already optimal — fastest AND
++0.25% PPL only); MiniCPM5-2B **Q4_K_M → Q8_0** (PPL +5.28%→+0.06%, AND 6.6% faster —
+dominates on every axis, low-risk official file, 1-line registry change); Qwen3-4B
+**Q4_K_M → Q5_K_M or Q8_0** (current file has a real quality defect: +15.24% PPL,
+abnormal for Q4_K_M, likely missing imatrix at quantize time). Laya **F16 recommended
+but BLOCKED**: 6.8x more accurate AND ~9% faster than current Q8_0, but
+`crates/laya-native`'s raw ggml code hardcodes `GGML_TYPE_Q8_0` in several places
+(`graph.rs`, `head.rs`) — swapping `laya serve`'s GGUF would desync the two
+implementations; needs Loop 13/14 coordination. **Two real bugs surfaced (not
+quant-related, side-findings)**: (a) `MAX_TOKENS=512` in the generation pipeline
+truncates Qwen3's chain-of-thought mid-`<think>` block, causing most of the observed
+"5/10 valid JSON" failures — likely a bigger win than any quant change, and unrelated
+to model choice; (b) `crates/models/src/download.rs`'s Laya registry entry points to
+`ud_q4_k_m.gguf` but production `laya serve` actually loads `q8_0.gguf` (registry
+currently references the WORST-measured variant) — harmless today (Laya's HTTP path
+doesn't read the registry) but misleading, pre-existing, not caused by this loop.
+**No production changes made this loop** (correctly gated per D_16 — quant swap needs
+re-validation on production's actual Ice Lake/no-AMX hardware since Q8_0's speed win
+here rode partly on AMX-INT8 dequant, an open risk explicitly flagged). Full
+K8s cleanup confirmed (`kubectl get pods,secrets -n llms-lab` → empty, quota back to
+0/32). Results: `docs/benchmarks/quantization-sweep-results.md` +
+`docs/benchmarks/quant-sweep-loop16/` (raw data + reusable harness scripts).
+
 ## Extended goal (2026-09-23): beat Jev's latency, not just match it
 
 New user directive after the original 6-item DoD was met: current performance still "too low"
