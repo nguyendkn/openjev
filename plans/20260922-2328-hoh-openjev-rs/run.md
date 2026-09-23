@@ -185,7 +185,64 @@ inference if needed, with microsecond-level profiling — "don't give up, try ha
   architecture spec — Loop 9 is a feasibility spike (GGUF tensor introspection, raw `ggml` FFI
   availability, config verification) before committing to a full rewrite.
 - User also requested a `docs/tutorial/` knowledge base consolidating all Jev/OpenJev/Laya
-  research + deployment lessons — delegated to `docs-manager`, in progress.
+  research + deployment lessons — delivered by `docs-manager`, 8 files + copy-paste-ready curl
+  examples for all 10 benchmark scenarios against the real server, committed.
+
+**Loop 9 verdict: GO, with measured evidence (not theoretical)** — a native Rust+raw-ggml
+rewrite of Laya's inference has ~10x headroom, not the marginal/negative return the initial
+D_9 framing worried about:
+- GGUF tensors are cleanly named (153 tensors), 1:1 mappable to the real architecture
+  (`github.com/NandhaKishorM/laya/blob/main/laya/common.py` + `convaiinnovations/laya/encoder/
+  config.json`: ModernBERT-large, 28 layers, 1024 hidden, 16 heads, GeGLU, alternating
+  global(θ=160000)/local-128(θ=10000) RoPE attention every 3rd layer). No safetensors fallback
+  needed. `ggmlc.graph_spec` GGUF metadata even ships the full 1364-node traced reference graph
+  to diff a hand-rolled implementation against.
+- Raw `ggml` C API is ALREADY FFI-bound via the existing `llama-cpp-sys-2` dependency (598
+  `ggml_*` functions, `build.rs:463-466`'s `.allowlist_function("ggml_.*")`) — proven by
+  actually building and running an 868-node graph through it. Zero new C vendoring/bindgen.
+- **The measured gap**: real kernel benchmarks on this exact server (Xeon Gold 5320, 28
+  threads) show a full 28-layer ModernBERT-large forward costs 117ms (seq=64) to 720ms
+  (seq=512) using the SAME `ggml_mul_mat` kernel `ggmlc` calls — vs. `laya serve`'s actual
+  1350ms-8500ms for the same lengths (7.7x-11.8x gap). Root cause: `ggmlc`'s generic
+  PyTorch-trace-to-graph compiler produces ~1364 nodes with heavy materialized
+  slice/transpose/cat/neg ops (memory-bound copies, e.g. `rotate_half` RoPE done as real tensor
+  ops instead of one fused `ggml_rope_ext` call) where a hand-written graph needs far fewer,
+  fused nodes. CPU threads are 98-100% utilized throughout — this is wasted work, not idle
+  time, confirming the overhead is structural (graph shape), not tunable via threads/quant
+  (which Loop 6/8 already extracted the easy wins from).
+- Reference output for correctness validation (Q8_0, current prod config): state "The capital
+  of France is: A) London B) Paris" → `probabilities: {A:0.414, B:0.586}`, `choice: B`,
+  `confidence: 0.0215` (supersedes an earlier stale UD_Q4_K_M-era reference number).
+- Full technical detail, all tensor/config/measurement evidence: Loop 9's Developer report
+  (not yet in a separate evidence file — folded into this run.md pending E_9/QA).
+
+**Loop 10 (delivered, QA passed): native encoder built, direction correct, speed confirmed
+~11.3x, probability gap NOT yet closed.** New crate `crates/laya-native` (28-layer ModernBERT
+via raw `ggml` FFI through the existing `llama-cpp-sys-2` dependency, standalone, NOT wired
+into production). Correct-direction result on the reference case (B wins, tokenizer matches
+`laya serve` exactly at 28 tokens) but probabilities aren't bit-exact yet: 0.599 vs reference
+0.586 — QA independently re-verified this is reproducible (bit-identical across 5 runs) and
+found no logic bug in the encoder itself via `graph_spec.json` cross-checks; remaining
+suspects are float-accumulation across 28 layers (Q8_0+F16 flash-attention) or the throwaway
+head/scorer (not yet layer-diffed). Speed: 114.47ms mean (QA's own 5-run measurement) vs
+`laya serve`'s 1296.65ms (QA's own 5-run measurement) = **11.3x**, exceeding even the 10.3x the
+Developer reported. QA found 3 new gaps in the new crate: **G21 (real, unclamped `k` read on
+the logits tensor — OOB/UB risk for >16-option questions, not yet triggered since only k=2
+tested so far, but this project's own benchmark scenarios go up to 5-way choice and Jev
+supports up to 255 options — must fix before real multi-option testing)**, G22 (raw ggml/gguf
+context pointers never `Drop`ped — permanent leak per graph-bucket, harmless for a short-lived
+probe, a real problem once wired into a long-running server), G23 (graph arena sizing is an
+unproven "rough upper bound", not asserted). Production confirmed completely unaffected
+(same PIDs throughout, health 200s, unchanged behavior).
+
+**Runtime decision for Loop 11**: (a) fix G21 now (cheap, real safety bug) before doing any
+further multi-option testing; (b) build an out-of-tree `ggmlc` debug copy (`/tmp/ggmlc-dbg`,
+NEVER touching `/tmp/ggmlc/build` where the live `laya` binary lives) to get layer-by-layer
+intermediate tensor diffs and actually close the probability gap, rather than continuing to
+guess; (c) the ~1.3% probability gap is NOT acceptable for a production cutover as-is — Loop 11
+must either close it with a proven root cause, or if it's provably bounded float noise
+(demonstrated across a broader test set, not just one example), document that bound explicitly
+before Loop 12 considers cutover.
 
 **Stop-gate note**: HoH's literal stop condition (`status: passed AND unresolved_gaps: [] AND
 regressions: []`) is not strictly met because the 4 tracked gaps above remain open — but none

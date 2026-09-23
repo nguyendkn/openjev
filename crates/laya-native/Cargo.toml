@@ -1,0 +1,13 @@
+[package]
+name = "laya-native"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Raw ggml_*/gguf_* C FFI. Already vendored+built by the workspace; no new bindgen.
+llama-cpp-sys-2 = "0.1.156"
+timing = { path = "../timing" }
+
+[[bin]]
+name = "laya-native-probe"
+path = "src/bin/probe.rs"
