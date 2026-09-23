@@ -302,12 +302,50 @@ topology empirically first — Loop 14 implementing.
 the Loop 11b perf logger to find real hotspots. Also now carrying the temperature-clamp
 correctness fix from Loop 15's finding (see below).
 
-**Loop 14 (in progress): multi-worker pool for `apps/server`** — empirical topology
-benchmarking (N workers × T threads) before implementation, consistent-hash routing so the
-same model always lands on the same worker (bounded RAM use), G13-style per-worker panic
-supervision preserved. Also carrying the `model=laya` 400-vs-500 error fix (real bug found
-independently — the internal-only `laya` registry entry was selectable via the public `model`
-field and crashed with a confusing 500 instead of a clean 400).
+**Loop 14 (delivered): multi-worker pool live in production, throughput genuinely improved.**
+Empirical topology benchmark (real data, not assumed) confirmed the hypothesis decisively:
+single-worker (1×28) throughput is FLAT at ~0.46-0.48 req/s regardless of concurrency level
+1/2/4/8 — proof it was fully serialized, queueing not parallelizing. Tested 1×28/2×14/4×7/8×4;
+**4 workers × 7 threads wins** (0.903 req/s peak, 1.90x the baseline; 8×4 collapses at
+concurrency 8 from oversubscription). Implemented `apps/server/src/pool.rs`: N=4 independent
+workers (own thread, own model cache, own `EngineConfig`, own G13 `catch_unwind` supervisor),
+least-inflight-with-model-affinity routing (same model prefers its warm worker; a 2nd
+concurrent request for a busy model goes to an idle worker instead of queueing — avoids both
+redundant reloads AND same-model serialization). Real concurrent-throughput proof (external
+curl, timestamped): 4-request mixed-model burst completes in 9.79s concurrent vs 19.37s
+sequential (1.98x), steady-state repeat 7.02s (2.76x) once all workers are warm. G13 fault
+injection re-verified at the NEW per-worker granularity: one worker panics/respawns, the other
+3 keep serving unaffected, self-heals in ~1 request. Also fixed the `model=laya` bug (400 with
+a clear message, was 500) — Runtime independently re-verified both the pool architecture
+(`ps aux` shows `--workers 4 --threads 7` live) and the `laya` fix.
+
+**Required side-fix**: found and fixed a real race condition in `crates/engine`'s
+`shared_backend()` — safe for exactly one caller (the old single-worker design), but multiple
+pool workers starting concurrently could both hit `LlamaBackend::init()` and one would fail
+with `BackendAlreadyInitialized`. Fixed with double-checked locking.
+
+**Root cause of the earlier production-starvation incidents, now confirmed**: Loop 14's own
+`topology_probe` benchmark (the `8×4 @ concurrency=8` cell put 32 engine threads on the box,
+stacking with the live server + Loop 13's own probe → load ~41, real `/bench` requests timed
+out for ~2 min). Self-diagnosed and fixed (one topology per run, 8s idle gaps, health-checked
+between cells) — not a deadlock, confirmed by the Developer's own account and consistent with
+Runtime's independent observations at the time.
+
+**Disclosed incident**: Loop 14 ran the repo's `make fmt` (`cargo fmt --all`), which
+reformatted files outside its own scope including one of Loop 13's test files
+(`crates/laya-native/tests/sequence_and_reference.rs`) — formatting-only (no semantics), and
+since there's no git repo on the remote server this couldn't be surgically reverted there.
+QA independently confirmed harmless: byte-diff shows exactly 3 bytes changed (trailing-comma
+style only), all 4 laya-native tests still pass, no content lost.
+
+**Loop 14 QA: PASSED, no blocking gaps.** All claims independently re-verified: real code =
+running prod code (byte-identical diff), genuine concurrent overlap (3 different-model
+requests finishing in ~18.7s wall vs ~31s serial sum), routing policy correctly avoids
+same-model bunching (independently reproduced), G13 per-worker fault injection reproduced via
+an isolated scratch copy (never touching the live artifact), `shared_backend()` fix reviewed
+as a genuine race fix (not cosmetic). Minor non-blocking notes: pool.rs still lacks committed
+unit tests (extends pre-existing G12, no new ledger row), live Laya-outage re-test deliberately
+deferred to avoid disrupting Loop 13's concurrent use of the same `laya serve` process.
 
 **User directive (new): GPU access granted on company K8s cluster** (context
 `fke-ncp-modas-stg-qc8ifaxe`, namespace `llms-lab`, provisioned this session to 32 CPU/128Gi

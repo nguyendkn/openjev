@@ -1,6 +1,8 @@
-// apps/server HTTP layer: DTOs, AppState (lazy-load + cache Engine per model), router,
-// bench_handler. Reuses crates::{engine,models,pipeline,timing} exactly as apps/cli does —
-// same reset_context ordering, same field names in the response, so the two surfaces agree.
+// apps/server HTTP layer: DTOs, AppState (a pool of engine workers), router, bench_handler.
+// Reuses crates::{engine,models,pipeline,timing} exactly as apps/cli does — same
+// reset_context ordering, same field names in the response, so the two surfaces agree.
+// The worker pool itself (threads, G13 supervisors, routing policy) lives in `pool.rs`.
+use crate::pool::Pool;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
@@ -10,9 +12,20 @@ use engine::{Engine, EngineConfig};
 use pipeline::{run_generate, run_laya, run_readout, GenerateResult, ReadoutResult};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Instant;
 use timing::Timings;
-use tokio::sync::{mpsc, oneshot};
+
+/// The only model ids this server will run through `Engine`/llama.cpp.
+///
+/// Deliberately NOT the full `models::REGISTRY`: the registry also contains a `laya` entry,
+/// which exists so `pipeline::laya` knows which GGUF to fetch for the separate `laya serve`
+/// process. That file is a ggmlc-format model, not a llama.cpp-compatible LLM, so accepting
+/// `{"model":"laya"}` here used to reach `Engine::load` and fail with a confusing HTTP 500
+/// (`model load failed: null result from llama cpp`). Laya is never selected via `model`
+/// anyway — it is always run as the 3rd comparison method and returned in the `laya` response
+/// field unless `skip_laya` is set — so it is rejected up front with a 400 instead.
+pub const SERVER_MODELS: [&str; 3] = ["qwen3-0.6b", "qwen3-4b", "minicpm5-2b"];
 
 /// Mirrors `apps/cli`'s `--options` semantics: a flat list of option labels, e.g. `["A","B"]`.
 #[derive(Debug, Deserialize)]
@@ -39,121 +52,49 @@ pub struct BenchReport {
     pub laya: Option<models::LayaScoreResult>,
 }
 
-/// One benchmark job handed to the dedicated engine-worker thread.
-struct WorkerJob {
-    req: BenchRequest,
-    resp: oneshot::Sender<Result<BenchReport, ApiError>>,
-}
-
 /// `Engine` wraps raw `llama-cpp-2`/FFI pointers (`NonNull<llama_context>`, raw sampler
 /// pointers) and is therefore `!Send` — confirmed by a real compile error when this was first
 /// attempted as `Arc<Mutex<HashMap<String, Engine>>>` shared across `tokio::task::spawn_blocking`
 /// closures (spawn_blocking requires `F: Send + 'static`, which a `HashMap<String, Engine>`
 /// can never satisfy). Since `Engine` can never cross a thread boundary, model caching+access is
-/// instead confined to one dedicated OS thread ("engine worker") for its entire lifetime — the
+/// confined to dedicated OS threads ("engine workers") for their entire lifetime — the
 /// actor/channel pattern the reference plan itself names as the fallback design (R2 §2
-/// alternative) when Mutex+spawn_blocking isn't viable. `AppState` only holds an
-/// `mpsc::Sender<WorkerJob>` (Send+Sync+Clone), so the async handler never touches `Engine`
-/// directly and never blocks inline — it sends a job and awaits a `oneshot` reply while the
-/// worker thread does the actual (possibly slow) inference work. Requests still fully serialize
-/// (one worker thread, one job at a time), same effective guarantee as the Mutex design.
+/// alternative) when Mutex+spawn_blocking isn't viable.
+///
+/// Loop 14: there is now a *pool* of N such worker threads instead of exactly one, so
+/// independent concurrent requests run in parallel on the 32-core box instead of queueing
+/// behind a single serialized worker (measured: 1 worker x 28 threads = 0.47 req/s at every
+/// concurrency level, i.e. perfectly flat/serialized; 4 workers x 7 threads = 0.90 req/s at
+/// concurrency 4). `AppState` still only holds `Send + Sync + Clone` handles (channel senders
+/// behind an `Arc<Pool>`), so the async handler never touches `Engine` directly and never
+/// blocks inline — it routes a job to a worker and awaits a `oneshot` reply while that worker
+/// thread does the actual (slow) inference work. See `pool.rs` for the routing policy and the
+/// per-worker G13 respawn supervisors.
 #[derive(Clone)]
 pub struct AppState {
-    tx: mpsc::Sender<WorkerJob>,
+    pool: Arc<Pool>,
 }
 
 impl AppState {
-    /// `n_threads`/`n_batch` are threaded through to every `EngineConfig` this server's
-    /// dedicated engine worker loads (Loop 6: `n_threads` was previously hardcoded to
-    /// `EngineConfig::default()`, making tuning require a recompile; Loop 7: same treatment for
-    /// `n_batch`; now real startup-time values, see `main.rs`'s `--threads`/`--batch` flags).
-    pub fn new(n_threads: i32, n_batch: u32) -> Self {
-        let (tx, rx) = mpsc::channel::<WorkerJob>(32);
-        std::thread::spawn(move || supervisor_loop(rx, n_threads, n_batch));
-        Self { tx }
-    }
-}
-
-/// G13 fix: owns the dedicated engine-worker thread's *outer* loop and recovers it from a
-/// panic instead of letting the thread (and the `mpsc::Receiver` it owns) die permanently.
-///
-/// Design choice — respawn-with-empty-cache, not per-job `catch_unwind` around a
-/// long-lived `HashMap<String, Engine>`: `Engine` (`crates/engine`) is a self-referential
-/// struct built with `unsafe` lifetime-widening (`LlamaContext<'static>` borrowing from a
-/// heap-boxed `LlamaModel` via `std::mem::transmute`), wrapping raw `llama-cpp-2`/FFI state.
-/// `std::panic::catch_unwind` only guarantees the *Rust* stack unwinds safely and no memory
-/// is freed twice/UB is triggered at the Rust level — it does NOT guarantee that whatever
-/// `Engine`'s FFI calls (`ctx.decode`, which crosses into llama.cpp's C layer and mutates
-/// its internal KV-cache/position bookkeeping) were doing at the moment of the panic left
-/// that FFI-side state in a form that's still correct to keep using. There is no documented
-/// `UnwindSafe`/panic-safety audit of `llama-cpp-2`'s internals to lean on here, and getting
-/// this wrong would fail silently (a corrupted `Engine` could keep answering requests with
-/// subtly wrong results instead of erroring), which is worse than the extra reload cost of
-/// respawning. So: `engines` is created fresh *inside* `worker_loop` on every (re)entry: if
-/// `worker_loop` panics, `catch_unwind` catches it here, the panicking stack frame's entire
-/// `engines: HashMap<String, Engine>` is dropped as part of unwinding (discarding every
-/// cached model, not just the implicated one), and the loop below immediately calls
-/// `worker_loop` again with a brand-new empty cache — self-healing within the same process,
-/// no operator restart needed, at the cost of one reload per model on next use. `rx` itself
-/// is untouched by the panic (it only ever produces `Some(job)`/`None` before `run_bench` is
-/// called, which is where a hypothetical panic would occur) and is safe to keep reusing
-/// across respawns; it is threaded through via `AssertUnwindSafe` since `&mut Receiver` is
-/// not `UnwindSafe` by default (that trait errs conservatively for any `&mut`, not because
-/// this specific type is actually at risk here).
-///
-/// The panicking request itself still gets a clean error, not a hang: its `WorkerJob::resp`
-/// (a `oneshot::Sender`) is a value local to the panicking `worker_loop` call and is dropped
-/// during unwinding without ever calling `.send(..)`; `bench_handler`'s `resp_rx.await` then
-/// resolves to `Err`, which it already maps to `ApiError::Internal("engine worker thread
-/// dropped the response")` (HTTP 500) — no code change needed there, this was already
-/// correct given how `oneshot` channels signal a dropped sender.
-fn supervisor_loop(mut rx: mpsc::Receiver<WorkerJob>, n_threads: i32, n_batch: u32) {
-    loop {
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            worker_loop(&mut rx, n_threads, n_batch)
-        }));
-        match outcome {
-            Ok(()) => return, // rx closed normally (all Senders/AppState clones dropped)
-            Err(payload) => {
-                let msg = panic_message(&*payload);
-                eprintln!(
-                    "engine worker thread panicked, respawning with an empty model cache: {msg}"
-                );
-                // loop continues: worker_loop is called again with a fresh HashMap below.
-            }
+    /// `n_workers` engine-worker threads, each with its own model cache and its own
+    /// `EngineConfig { n_threads, n_batch }` (so total CPU demand is `n_workers * n_threads`
+    /// — keep that at/below the core count). `n_threads`/`n_batch` are startup-time values
+    /// (Loop 6/7: `--threads`/`--batch`), `n_workers` is Loop 14's `--workers`.
+    pub fn new(n_workers: usize, n_threads: i32, n_batch: u32) -> Self {
+        Self {
+            pool: Arc::new(Pool::new(n_workers, n_threads, n_batch)),
         }
-    }
-}
-
-/// Best-effort extraction of a panic's message for logging (`std::panic::PanicHookInfo`/the
-/// `catch_unwind` payload is `Box<dyn Any + Send>`; the two conventional payload shapes are
-/// `&str` for `panic!("literal")` and `String` for `panic!("{}", formatted)`).
-fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
-    if let Some(s) = payload.downcast_ref::<&str>() {
-        s.to_string()
-    } else if let Some(s) = payload.downcast_ref::<String>() {
-        s.clone()
-    } else {
-        "<non-string panic payload>".to_string()
-    }
-}
-
-/// One worker-thread lifetime's worth of job processing, from an empty model cache until the
-/// channel closes or a panic unwinds out of here (see `supervisor_loop`).
-fn worker_loop(rx: &mut mpsc::Receiver<WorkerJob>, n_threads: i32, n_batch: u32) {
-    let mut engines: HashMap<String, Engine> = HashMap::new();
-    while let Some(job) = rx.blocking_recv() {
-        let mut _s = timing::perf_span!("server::worker_loop::job");
-        _s.set("model", job.req.model.clone());
-        let result = run_bench(&mut engines, job.req, n_threads, n_batch);
-        let _ = job.resp.send(result);
     }
 }
 
 impl Default for AppState {
     fn default() -> Self {
         let defaults = EngineConfig::default();
-        Self::new(defaults.n_threads, defaults.n_batch)
+        Self::new(
+            crate::pool::DEFAULT_WORKERS,
+            defaults.n_threads,
+            defaults.n_batch,
+        )
     }
 }
 
@@ -169,7 +110,14 @@ pub enum ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, message) = match self {
-            ApiError::UnknownModel(m) => (StatusCode::BAD_REQUEST, format!("unknown model: {m}")),
+            ApiError::UnknownModel(m) => (
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "unknown model '{m}' — valid models: {}. Laya is always included \
+                     automatically in the 'laya' field of the response unless skip_laya is set.",
+                    SERVER_MODELS.join(", ")
+                ),
+            ),
             ApiError::InvalidOptions(m) => (StatusCode::BAD_REQUEST, m),
             ApiError::Engine(m) => (StatusCode::INTERNAL_SERVER_ERROR, m),
             ApiError::Internal(m) => (StatusCode::INTERNAL_SERVER_ERROR, m),
@@ -207,15 +155,26 @@ impl From<pipeline::PipelineError> for ApiError {
     }
 }
 
+/// Rejects anything that isn't one of the three llama.cpp-compatible LLMs — notably `laya`
+/// (see [`SERVER_MODELS`]) — with a 400 *before* the request is ever routed to a worker, so a
+/// bad id can never occupy a worker or reach `Engine::load`.
+pub fn validate_model(model: &str) -> Result<(), ApiError> {
+    if SERVER_MODELS.contains(&model) {
+        Ok(())
+    } else {
+        Err(ApiError::UnknownModel(model.to_string()))
+    }
+}
+
 async fn health() -> StatusCode {
     StatusCode::OK
 }
 
-/// Runs one full readout+generate benchmark pass for `req` against `engines` (the engine
+/// Runs one full readout+generate benchmark pass for `req` against `engines` (one engine
 /// worker's local, thread-confined model cache), ensuring the model is loaded+cached first.
-/// Pure blocking work — only ever called on the dedicated engine-worker thread, never inline in
-/// an async handler (see `AppState` doc comment for why this replaces `spawn_blocking` here).
-fn run_bench(
+/// Pure blocking work — only ever called on an engine-worker thread, never inline in an async
+/// handler (see `AppState`'s doc comment for why this replaces `spawn_blocking` here).
+pub(crate) fn run_bench(
     engines: &mut HashMap<String, Engine>,
     req: BenchRequest,
     n_threads: i32,
@@ -223,6 +182,10 @@ fn run_bench(
 ) -> Result<BenchReport, ApiError> {
     let mut _s = timing::perf_span!("server::run_bench");
     _s.set("model", req.model.clone());
+    // Defense in depth: `bench_handler` already validated this before dispatch, but
+    // `run_bench` is the only thing that can reach `Engine::load`, so it re-checks rather
+    // than trusting its caller.
+    validate_model(&req.model)?;
     if req.options.is_empty() {
         return Err(ApiError::InvalidOptions(
             "options must list at least one option, e.g. [\"A\",\"B\"]".to_string(),
@@ -258,7 +221,9 @@ fn run_bench(
         let _ = models::find(&req.model)?; // still validate the id even on cache hit
     }
 
-    let engine = engines.get_mut(&req.model).expect("just inserted or present");
+    let engine = engines
+        .get_mut(&req.model)
+        .expect("just inserted or present");
 
     // Unlike apps/cli (one process per run), this Engine is cached and reused across separate
     // HTTP requests. Reset the KV cache before starting this request's work so a previous
@@ -317,16 +282,9 @@ pub async fn bench_handler(
     State(state): State<AppState>,
     Json(req): Json<BenchRequest>,
 ) -> Result<Json<BenchReport>, ApiError> {
-    let (resp_tx, resp_rx) = oneshot::channel();
-    state
-        .tx
-        .send(WorkerJob { req, resp: resp_tx })
-        .await
-        .map_err(|_| ApiError::Internal("engine worker thread unavailable".to_string()))?;
-    let result = resp_rx
-        .await
-        .map_err(|_| ApiError::Internal("engine worker thread dropped the response".to_string()))?;
-    result.map(Json)
+    // Validate before routing: an unknown/non-LLM model id must not consume a worker slot.
+    validate_model(&req.model)?;
+    state.pool.dispatch(req).await.map(Json)
 }
 
 pub fn router(state: AppState) -> Router {

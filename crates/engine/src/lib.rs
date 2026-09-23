@@ -11,9 +11,12 @@ use llama_cpp_2::sampling::LlamaSampler;
 use llama_cpp_2::token::LlamaToken;
 use std::num::NonZeroU32;
 use std::path::Path;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 static BACKEND: OnceLock<LlamaBackend> = OnceLock::new();
+/// Serializes the `shared_backend()` slow path so concurrent pool workers cannot race two
+/// `LlamaBackend::init()` calls against each other (see `shared_backend`).
+static INIT_LOCK: Mutex<()> = Mutex::new(());
 
 /// Returns the process-wide shared llama.cpp backend, initializing it on first call.
 /// `LlamaBackend::init()` is a process-global singleton (an internal `AtomicBool` in
@@ -30,9 +33,23 @@ static BACKEND: OnceLock<LlamaBackend> = OnceLock::new();
 /// until process exit, which is fine since the process keeps its model cache alive for its
 /// whole life anyway) fixes this. Not guarded against concurrent first-call races: the only
 /// two callers never call this concurrently (`apps/cli`: one `Engine`, one thread;
-/// `apps/server`: one dedicated worker thread processes jobs sequentially — see `AppState`'s
-/// doc comment in `apps/server/src/app.rs`).
+/// `apps/server`: N pool worker threads, which CAN call this concurrently on first load —
+/// see the Loop 14 note below).
+///
+/// Loop 14 (multi-worker pool): the old body was a plain check-then-init and raced as soon as
+/// more than one thread could call it. Two pool workers starting at the same time could both
+/// observe an empty `BACKEND` and both call `LlamaBackend::init()`; the loser gets
+/// `BackendAlreadyInitialized` back, which became a hard `EngineError::BackendInit` failure
+/// for a request that should have succeeded. `INIT_LOCK` now serializes the slow path
+/// (double-checked locking — the fast path stays a lock-free `OnceLock::get`), so exactly one
+/// `init()` ever runs and every other caller waits and then reads the stored backend. A
+/// poisoned lock is recovered with `into_inner()`: the guarded region only calls `init()` and
+/// `OnceLock::get_or_init`, so a panic inside it leaves no half-written shared state behind.
 fn shared_backend() -> Result<&'static LlamaBackend, EngineError> {
+    if let Some(backend) = BACKEND.get() {
+        return Ok(backend);
+    }
+    let _guard = INIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(backend) = BACKEND.get() {
         return Ok(backend);
     }
