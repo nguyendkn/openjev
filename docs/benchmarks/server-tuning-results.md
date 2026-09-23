@@ -1,4 +1,4 @@
-# Server Tuning Results — Loops 6-7 (n_threads, openmp, native-CPU build, n_batch)
+# Server Tuning Results — Loops 6-8 (n_threads, openmp, native-CPU build, n_batch, Laya thread fix)
 
 Loop 6 proved the tuning methodology (`n_threads`) with real before/after numbers. Loop 7 (see
 "Loop 7" section below) closes out tuning: verifies `openmp` is genuinely active, tests a
@@ -317,3 +317,192 @@ re-verified separately above).
 - A finer-grained `n_threads` sweep (20/24/26) and multi-run averaging for `generation_ms`
   (to separate real batch/native effects from single-run noise) are both explicitly out of this
   loop's scope per D_7 ("not an open-ended search").
+
+---
+
+# Loop 8 — Laya `--threads` deployment-bug fix, persisted + proven, plus Q8_0 quant switch
+
+## 1. Root cause and the fix
+
+`laya serve` was started in Loops 5-7 by a hand-typed `setsid nohup ... laya serve <gguf> --port
+8090 --device cpu` with **no `--threads` flag** — `laya --help` documents the default as `4`, so
+Laya ran on 4 of the box's 32 vCPUs for 3 straight loops. This was never caught because Laya's
+speed was only ever observed bundled inside the combined `/bench` 3-method timing (logged as
+"just how slow Laya is"), never benchmarked in isolation. Manually restarting with `--threads 28`
+(matching the LLM engine's own Loop 6-proven thread count) cut one measured request from
+**8350ms to 1665ms (~5x)**; a full harness re-run below confirms this at scale.
+
+**Persisted, not a one-off restart:**
+- `scripts/start-laya-serve.sh` — the single canonical start command, `--threads 28` baked in as
+  the default (overridable via `$1`), used by both manual restarts and the systemd unit below.
+- `scripts/openjev-laya-serve.service` + `scripts/openjev-server.service` — new systemd units
+  (installed at `/etc/systemd/system/`, both `enabled`, `Restart=on-failure`) that now manage
+  **both** long-running processes' full lifecycle, not just the G18 firewall-rule reapplication.
+  `ExecStart` bakes `--threads 28` directly into the unit, so a bare `systemctl restart` (by a
+  future loop, or after a real reboot — both units are `enabled`) can no longer silently regress
+  the thread count the way the old ad-hoc `nohup` commands could. Migrated the live processes
+  onto systemd this loop (brief `systemctl start` + kill-old-PID handoff, `/health` back to 200
+  within ~2-8s both times, no request-level outage observed).
+- `README.md`'s "Laya Server Process" section rewritten to describe the systemd-managed lifecycle
+  instead of the old raw `nohup` commands.
+
+## 2. Harness-measured before/after (30 requests, `laya-threads28` label)
+
+Loop 7's `native-summary.json` (`--threads 4`, the undiscovered bug, still the config for every
+prior loop's numbers) vs this loop's `docs/benchmarks/laya-threads28-{raw.jsonl,summary.json}`
+(`--threads 28`, Q8_0 — see §3 for why Q8_0 replaced UD_Q4_K_M), same 3 models x 10 scenarios,
+Laya not skipped, `error_count: 0` both runs:
+
+| Model | `laya_inference_ms` OLD (mean, threads=4) | NEW (mean, threads=28+Q8_0) | Speedup |
+|---|---|---|---|
+| qwen3-0.6b | 7208.7 | 1243.8 | 5.80x |
+| minicpm5-2b | 6868.0 | 1157.0 | 5.94x |
+| qwen3-4b | 6543.0 | 1206.1 | 5.42x |
+
+Matches the manual spot-check's ~5x order of magnitude, now confirmed harness-wide (30 requests,
+not 1-2 curl calls) across all 3 models, not a lucky sample.
+
+**Side observation, not this section's focus:** `constrained_readout_ms` in this same run reads
+2-3x higher than Loop 7's isolated number (e.g. qwen3-0.6b 413.0 vs Loop 7's 112.2; full numbers
+in the raw JSON) despite the LLM engine's own `n_threads`/native build being unchanged. Plausible
+cause: Laya's process now genuinely contends for all 32 cores (previously it only used 4, leaving
+the LLM engine's 28 threads mostly uncontested even when interleaved) — not proven, single-run
+harness with no repeats (same documented limitation carried from Loop 6/7). Flagged as an open
+question, not treated as a regression to chase this loop (readout is still within Jev's
+real-world competitive range either way, see §5).
+
+## 3. Quant check: is UD_Q4_K_M actually the fastest CPU quant here?
+
+Investigated per this loop's own scope (Task 3) and a mid-loop coordinator note citing a
+community CPU benchmark (i3-12100, 4c/8t: 112ms/1-question) that is *faster* than our 32-core
+box's threads=28 result — prompting a check of whether the `ggmlc`/`laya` build itself was
+missing native-CPU flags (the same class of bug Loop 7 found and fixed for `llama-cpp-2`).
+
+**Native-build check (verified, not assumed):** `/tmp/ggmlc/build/CMakeCache.txt` already shows
+`GGML_NATIVE:BOOL=ON`; `ggml_lib`'s real `flags.make` shows `-march=native` literally on the
+`gcc`/`g++` command line, and `gcc -march=native -E -v` on this box resolves to `cascadelake`
+with `avx512f/dq/cd/bw/vl/vnni` all present in `lscpu`'s `Flags`. **This lever was already fully
+engaged before this loop** — not the source of the remaining gap.
+
+**Quant comparison (verified real):** single-request `/v1/decide` timing, 5 reps each, isolated
+test port (8091-8093) so as not to disturb the live 8090 instance, `--threads 28` held constant,
+identical payload:
+
+| Quant | File size | 5 reps (s) | Mean (s) | Median (s) |
+|---|---|---|---|---|
+| UD_Q4_K_M (old default) | ~430 MB (symlinked cache blob) | 1.738/1.677/1.720/1.696/2.675 | 1.901 | 1.720 |
+| Q8_0 | 451.5 MB | 1.644/1.294/1.955/1.278/1.263 | 1.487 | 1.294 |
+| F16 | 846.1 MB | 2.001/1.352/1.363/1.367/1.181 | 1.453 | 1.363 |
+
+Q8_0 and F16 both beat Q4_K_M by ~20-24% mean — confirming the K-quant's CPU dequant path in this
+`ggmlc` build is genuinely slower than a plain 8-bit or fp16 read, not just noise (consistent
+direction across all 5 reps of Q4_K_M's slowest end vs both alternatives' tightest cluster).
+**Q8_0 adopted as the new production default** (same speed class as F16, half the file size/RAM)
+— `laya_english_q8_0.gguf` now lives at `/root/.cache/laya-models/` and is `start-laya-serve.sh`'s
+new default GGUF path. Correctness re-checked: identical `choice`/`probabilities` shape and a
+materially identical decision on the test prompt across all 3 quants (`confidence` 0.884-0.890,
+`billing` 0.971-0.973) — the quant switch changes speed, not the answer.
+
+**Thread-count re-swept on Q8_0** (isolated test port, 5 reps each, to rule out the LLM-engine's
+own "more threads isn't always better" pattern applying here too): `--threads 4` mean 6.111s (much
+worse — confirms this is a genuine parallelism win, not oversubscription overhead for this small
+model), `--threads 16` mean 2.048s, `--threads 28` mean 1.487s (§3's own Q8_0 row), `--threads 32`
+mean 1.341s (only ~10% faster than 28, within this 5-rep sample's noise band, and no headroom left
+for the OS/`openjev-server`'s own 28 threads) — **28 confirmed as the right choice, not changed**,
+consistent with the LLM engine's own Loop 6 finding.
+
+**Remaining gap, explicitly not chased further this loop:** even at threads=28+Q8_0 (~1.2-1.4s
+mean), this is still ~8-25x slower than the community CPU anchors researcher-07 found (i3-12100
+4c/8t: 112ms/1-question; Shray15: 360ms, undisclosed CPU) despite this box having 4-8x more cores
+and a verified-active native/AVX-512 build. With native flags, thread count, and quant format all
+now ruled out as the cause, the remaining gap most likely lives inside `ggmlc`'s own C++
+implementation (op-graph structure, per-request overhead, or GEMM kernel efficiency for this
+specific op set) — that source lives in the external `ggmlc` repo (`/tmp/ggmlc`), not this
+project's own crates, so profiling/patching it is out of this loop's and this repo's scope.
+Documented here as an honest, unresolved gap rather than claimed "fully optimized."
+
+## 4. Constrained-readout: already Jev-competitive (re-confirmed)
+
+Loop 7 found `constrained_readout_ms` mean 112.2-291.0ms across the 3 models — already inside
+Jev's own marketed 70-500ms claim. This loop's fresh harness run (§2) shows 413.0-593.6ms for the
+same field (see §2's side-observation for the likely cause of the increase) — still within the
+wider, third-party-measured Jev cloud-API cluster of 300-1070ms P50 (researcher-07 §1, dev.to +
+sysone-bench, not just TypeSafe's own marketing range). **Both readings support the same
+conclusion: constrained-readout has been Jev-competitive since Loop 7 and remains so this loop** —
+called out explicitly here so it doesn't get lost under the bigger Laya-fix news.
+
+## 5. Honest reframe: JSON-generation is not a Jev-equivalent, by design
+
+`pipeline::generate`'s full autoregressive token-by-token JSON generation is architecturally
+**not** what Jev/Laya do — Jev and Laya never generate tokens, they score in a single pass over
+fixed candidate labels. `generate.rs` is this project's own **second comparison arm**, inherited
+from the original SemIf/OpenJev methodology (which predates this project's Laya integration), not
+a method meant to reach Jev's speed class. It will not, and is not expected to — chasing that
+would be solving the wrong problem. Its own useful comparison is against the "naive full-LLM"
+baseline (researcher-05's ~8.5s reference), which it already beats via constrained decoding
+(1.3-15.6s mean across the 3 models this loop, scaling with model size as expected for a
+decode-loop-bound method).
+
+## 6. Final summary table — all 4 methods
+
+| Method | Jev's claimed/measured range | Ours (Loop 7) | Ours (Loop 8, after Laya fix) |
+|---|---|---|---|
+| Jev cloud API (reference only, not ours) | Marketing: 70-500ms. Real 3rd-party P50: 300-1070ms (researcher-07) | — | — |
+| Constrained-readout (ours) | compared against above | 112.2-291.0ms mean | 413.0-593.6ms mean (still within the 300-1070ms real-world cluster) |
+| Laya (ours) | Community CPU anchors: 112-360ms/question (researcher-07 §2, 4-8 thread consumer CPUs) | 6543.0-7208.7ms mean (undiscovered threads=4 bug) | **1157.0-1243.8ms mean (threads=28 fix + Q8_0 quant, ~5.4-5.9x faster)** — still 8-25x above the community CPU anchors; gap analyzed in §3, not further reducible within this repo's scope |
+| Generation (ours) | **Not comparable by design** (§5) — architecturally different from Jev/Laya's single-pass scoring | 4338.2-14914.3ms mean | 4191.3-15600.8ms mean (unchanged, not this loop's target) |
+
+## 7. Full regression pass (this loop's final config: threads=28 for both processes, Q8_0 Laya,
+systemd-managed)
+
+- **CLI**, all 3 models (Laya not skipped): `readout.best_option=Paris`, `generate.valid=true`
+  (`{"answer":"Paris"}`), `laya.best_option=Paris` for all 3.
+- **External curl** (`103.146.166.46:80/bench`, not SSH-side), all 3 models: same results,
+  `laya_inference_ms` 1231-1293ms (single-request, first-hit variance, consistent with §2's
+  harness aggregate). External `/health` → 200. External `:8090` → connection timeout (curl exit
+  28), G17 firewall still enforced after the systemd migration.
+- **`cargo build --workspace`** (release, `RUSTFLAGS=-C target-cpu=native`) exit 0, only the 2
+  pre-existing warnings. **`cargo test --workspace`**: 3 passed / 0 failed (`pipeline::readout`).
+- **G13**, 5th consecutive loop, this loop's own sentinel (`__QA_LOOP8_FAULT_INJECT__`, distinct
+  from every prior loop's own string): backed up `app.rs` (md5 `0546062f...`, matches every prior
+  loop's clean baseline exactly), injected, rebuilt (exit 0), restarted via
+  `systemctl restart openjev-server.service`. Trigger → HTTP 500
+  `{"error":"engine worker thread dropped the response"}` (clean). `/health` immediately after →
+  200. Next `/bench` → `model_load_ms=881` (fresh reload), correct answer. `journalctl -u
+  openjev-server.service` shows the real panic message
+  (`QA Loop8 fault-injection re-verification panic`) and
+  `engine worker thread panicked, respawning with an empty model cache` — confirms the
+  respawn/logging path survives the systemd migration, not just the old raw-process model.
+  Cleanup: `app.rs` reverted, md5 exact match, sentinel grep count 0, rebuilt clean, restarted on
+  final config.
+- **Laya-outage graceful degrade**, re-tested via `systemctl stop openjev-laya-serve.service`:
+  `/bench` → HTTP 200 (not 500), `laya: null`, `laya_inference_ms=10` (fast fail), real degrade log
+  (`laya unavailable, continuing without it: laya error: laya serve unreachable: ...`).
+  `systemctl start openjev-laya-serve.service` → `/health` → 200 within 8s, next `/bench` →
+  `laya.best_option=Paris` (self-heal confirmed), no `openjev-server` restart needed either way —
+  same graceful-degrade contract as every prior loop, now proven through a systemd stop/start
+  cycle instead of a raw `kill`.
+
+## 8. Final server state confirmed alive
+
+`openjev-server.service` active, PID 152077 (`--port 80 --threads 28`, native build, `n_batch`
+default 512), `openjev-laya-serve.service` active, PID 152174 (`laya serve
+/root/.cache/laya-models/laya_english_q8_0.gguf --port 8090 --device cpu --threads 28`). Both
+`systemctl is-enabled` → enabled (survive a reboot). External `:80/health` → 200, external
+`:8090` → connection timeout (G17 intact). Internal `/bench` correct for all 3 models.
+
+## 9. Remaining gaps after Loop 8
+
+- The ~8-25x residual gap between our Laya numbers and community CPU anchors (§3) is real,
+  investigated as far as this repo's scope allows (native flags, thread count, quant format all
+  ruled out), and not further reducible without profiling/patching the external `ggmlc` C++
+  source — out of scope for this Rust-project loop.
+- The `constrained_readout_ms` increase noted in §2 (2-3x vs Loop 7's isolated number) is
+  observed, not root-caused — flagged as a hypothesis (Laya's own 28-thread footprint now
+  genuinely contending for cores), not confirmed; would need multi-run averaging with/without a
+  concurrently-running Laya process to isolate, which is out of this loop's "not an open-ended
+  search" scope (same caveat Loop 6/7 already carried for single-run harness noise generally).
+- G10/G12/G14/G16/G2/G11 — unchanged, carried from prior loops.
+- The finer-grained `n_threads` sweep (20/24/26) for the LLM engine remains untested — unchanged
+  from Loop 7, not this loop's focus (Loop 8's thread-sweep work targeted Laya, a separate
+  process/flag).

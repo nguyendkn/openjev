@@ -1,0 +1,13 @@
+[Unit]
+Description=openjev-server (port 80) -- openjev-rs HTTP API (n_threads=28, native-CPU build)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/tmp/openjev
+ExecStart=/tmp/openjev/target/release/openjev-server --port 80 --threads 28
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

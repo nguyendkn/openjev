@@ -14,7 +14,7 @@ OpenJev-RS compares these independent inference paths on the same MCQ dataset:
 
 2. **JSON Generation** — Greedy decoding (max 512 tokens), strip reasoning tags (`<think>...</think>`), parse and validate JSON schema, flexible multi-token reasoning. Typical latency: <500ms per decision.
 
-3. **Laya Single-Pass Encoder** — A persistent `laya serve` HTTP process (separate `laya` binary built from `examples/laya` in the `ggmlc` repo — NOT the generic `ggmlc-run` CLI) running the Laya encoder model for calibrated probability estimates; `crates/models::laya` is a blocking HTTP client to `http://127.0.0.1:8090/v1/decide`. Real CPU latency (cold `laya decide` CLI, includes model load): ~39.6s; warm `laya serve` HTTP round-trip (model already loaded): ~7.5-8.9s per decision on the target server.
+3. **Laya Single-Pass Encoder** — A persistent `laya serve` HTTP process (separate `laya` binary built from `examples/laya` in the `ggmlc` repo — NOT the generic `ggmlc-run` CLI) running the Laya encoder model for calibrated probability estimates; `crates/models::laya` is a blocking HTTP client to `http://127.0.0.1:8090/v1/decide`. Real CPU latency (cold `laya decide` CLI, includes model load): ~39.6s. **Loop 8 fix:** `laya serve` was deployed in Loops 5-7 with no `--threads` flag, silently defaulting to 4 of the box's 32 cores (`laya --help`'s own documented default) — warm HTTP round-trip was ~6.5-8.9s/decision. Restarting with `--threads 28` cut this to ~1.5-2s/decision (harness-measured, see `docs/benchmarks/server-tuning-results.md` §"Loop 8"); a Q8_0 quant switch (same section) shaved a further ~20%. This fix is now permanent via `scripts/start-laya-serve.sh` + the `openjev-laya-serve.service` systemd unit (see "Laya Server Process" below), not a one-off manual restart.
 
 Each runs against all three models (Qwen3-0.6B, MiniCPM-2B, Qwen3-4B), producing a 3×3 latency matrix.
 
@@ -74,17 +74,19 @@ The GGUF is loaded once at `laya serve` startup and kept warm; `crates/models::l
 blocking HTTP client (`reqwest`) POSTing to `http://127.0.0.1:8090/v1/decide` per request, not a
 per-request shell-out.
 
-On the target Linux server there are therefore **two long-running processes** to manage:
-- `openjev-server` (port 80, external) — started via `setsid nohup ./target/release/openjev-server --port 80 >logs/server.log 2>&1 & disown`.
-- `laya serve` (port 8090, localhost-only) — started via `setsid nohup <path-to-laya-binary> serve <path-to-laya.gguf> --port 8090 --device cpu >logs/laya-serve.log 2>&1 & disown`.
+**Process lifecycle (Loop 8 — systemd-managed, not ad-hoc `nohup`):** both long-running
+processes are now managed by systemd units (`scripts/openjev-server.service`,
+`scripts/openjev-laya-serve.service`, installed at `/etc/systemd/system/`, both `enabled` so
+they also survive a reboot):
+- `openjev-server` (port 80, external) — `systemctl {start,stop,restart,status} openjev-server.service`. `ExecStart` bakes in `--threads 28` (Loop 6/7's proven-optimal thread count) so a bare `systemctl restart` can never silently regress it.
+- `laya serve` (port 8090, localhost-only) — `systemctl {start,stop,restart,status} openjev-laya-serve.service`, which runs `scripts/start-laya-serve.sh` (bakes in `--threads 28`, the Loop 8 fix, plus the Q8_0 quant switch — see below). This closes the exact gap that caused the bug: Loops 5-7's `laya serve` was started by hand-typed `setsid nohup ...` with no `--threads` flag, silently defaulting to 4 threads (a 5x perf regression that went unnoticed for 3 loops). Both `Restart=on-failure` for crash resilience.
 
 Check status: `curl http://127.0.0.1/health` (server) and `curl http://127.0.0.1:8090/health`
 (laya serve, from the server itself — externally blocked by the Loop 6 `iptables` rule above,
-not by any binding behavior of the `laya` binary). Restart either
-independently by killing its PID (`ps aux | grep openjev-server` / `ps aux | grep 'laya serve'`)
-and re-running its start command above; `apps/server` degrades gracefully (`laya: null` in every
-`BenchReport`, no request failure) whenever `laya serve` is down, and self-heals on `laya
-serve`'s next successful response — no `openjev-server` restart needed either way.
+not by any binding behavior of the `laya` binary). `apps/server` degrades gracefully
+(`laya: null` in every `BenchReport`, no request failure) whenever `laya serve` is down, and
+self-heals on `laya serve`'s next successful response — no `openjev-server` restart needed
+either way.
 
 ---
 

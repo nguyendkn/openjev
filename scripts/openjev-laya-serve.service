@@ -1,0 +1,13 @@
+[Unit]
+Description=laya serve (port 8090) -- openjev-rs Laya comparison-method process (Loop 8: threads=28 fix, systemd-managed lifecycle)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/tmp/openjev
+ExecStart=/tmp/openjev/scripts/start-laya-serve.sh 28 8090
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

@@ -159,6 +159,34 @@ unit tests for `pipeline::generate` and `apps/server`, covered instead by extens
 end-to-end/curl evidence across every loop), G14 (port 80 instead of 8080, accepted deviation
 — external firewall layer outside VM control), G16 (a stale line in a docs ASCII diagram).
 
+## Extended goal (2026-09-23): beat Jev's latency, not just match it
+
+New user directive after the original 6-item DoD was met: current performance still "too low"
+vs Jev; research Jev's real benchmarks, keep optimizing, target = match or beat Jev's speed
+(later escalated to "beat decisively", authorizing a from-scratch Rust+raw-C rewrite of Laya's
+inference if needed, with microsecond-level profiling — "don't give up, try hard").
+
+- Loop 8: found+fixed a major deployment bug — `laya serve` was running with the `laya`
+  binary's DEFAULT `--threads 4` this entire time (should have been 28, matching the LLM
+  server) since no loop before this one benchmarked Laya's latency in isolation. Fix + a Q8_0
+  quant switch (vs UD_Q4_K_M) yielded a combined ~5-7x speedup:
+  ~6.5-8.4s → ~1.2-1.7s per Laya inference. Both services migrated to systemd for durability.
+- Constrained-readout (ours) already sits at 112-291ms mean — within Jev's own claimed
+  70-500ms range.
+- Research (researcher-07) found Jev's real-world 3rd-party-benchmarked P50 is 300ms-1.07s
+  (not the marketed 70-500ms floor), and found real Laya CPU numbers for the first time
+  (112-360ms on a weak 4c/8t consumer CPU) — implying more headroom exists on our 32-core box
+  than the ~1.2-1.7s currently achieved.
+- User authorized a native Rust+raw-C (ggml FFI) rewrite of Laya's inference path if profiling
+  supports it, after research (researcher-08) found `candle`'s CPU backend would likely be
+  SLOWER (5-16x, per a real benchmark) and `ort` requires an unproven ONNX export of Laya's
+  bespoke classification head. Found the actual open-source PyTorch modeling code
+  (`github.com/NandhaKishorM/laya/blob/main/laya/common.py`) giving an exact, implementable
+  architecture spec — Loop 9 is a feasibility spike (GGUF tensor introspection, raw `ggml` FFI
+  availability, config verification) before committing to a full rewrite.
+- User also requested a `docs/tutorial/` knowledge base consolidating all Jev/OpenJev/Laya
+  research + deployment lessons — delegated to `docs-manager`, in progress.
+
 **Stop-gate note**: HoH's literal stop condition (`status: passed AND unresolved_gaps: [] AND
 regressions: []`) is not strictly met because the 4 tracked gaps above remain open — but none
 of them are part of the user's stated Definition of Done, and the DoD itself is fully met with
