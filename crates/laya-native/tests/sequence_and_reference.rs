@@ -82,6 +82,11 @@ fn reference_question_picks_b_with_28_tokens() {
         return;
     }
     let mut m = laya_native::LayaNative::load(MODEL, 28).expect("load");
+    // Bit-parity with `laya serve` is only claimed under ITS padding policy. The crate default is
+    // `DEFAULT_SEQ_ALIGN` (user decision 2026-09-23: ~2x speed, <=2.6pp probability drift); this
+    // test deliberately pins `seq_align = 0` so it keeps guarding the kernel-level agreement that
+    // Loop 11 fought for. `reference_question_at_default_padding` covers the shipped path.
+    m.seq_align = 0;
     let opts = vec!["A".to_string(), "B".to_string()];
     let q = laya_native::choice_question("Pick the correct option.", &opts);
     let r = m.score("The capital of France is: A) London B) Paris", &q).expect("score");
@@ -98,5 +103,32 @@ fn reference_question_picks_b_with_28_tokens() {
         assert!((r.probabilities[0] - 0.4140).abs() < 1e-3 && (r.probabilities[1] - 0.5860).abs() < 1e-3,
             "native build must match `laya serve` (A=0.4140 B=0.5860), got {:?}", r.probabilities);
         assert!((r.confidence - 0.0215).abs() < 1e-3, "confidence {} != 0.0215", r.confidence);
+    }
+}
+
+/// The shipped path: `DEFAULT_SEQ_ALIGN` pads 28 tokens to 32, not to `laya serve`'s 64 bucket.
+///
+/// What is asserted is exactly what the 2026-09-23 decision promised: the padded length shrinks
+/// (that is where the ~2x comes from), the winning option is unchanged, and the probability drift
+/// stays inside the 2.6pp envelope that was measured and accepted. It deliberately does NOT
+/// assert bit-parity with `laya serve` — that is the whole point of the trade.
+#[test]
+fn reference_question_at_default_padding() {
+    if !std::path::Path::new(MODEL).exists() {
+        eprintln!("skipping: {MODEL} not present on this host");
+        return;
+    }
+    let mut m = laya_native::LayaNative::load(MODEL, 28).expect("load");
+    assert_eq!(m.seq_align, laya_native::DEFAULT_SEQ_ALIGN, "default must be the tight padding");
+    let opts = vec!["A".to_string(), "B".to_string()];
+    let q = laya_native::choice_question("Pick the correct option.", &opts);
+    let r = m.score("The capital of France is: A) London B) Paris", &q).expect("score");
+    assert_eq!(r.n_tokens, 28);
+    assert_eq!(r.seq, 32, "28 tokens must pad to 32, not to the 64 bucket");
+    assert_eq!(r.choice, 1, "option B must still win, got {:?}", r.probabilities);
+    if cfg!(target_feature = "avx512f") {
+        // measured: A=0.3949 B=0.6051 (vs `laya serve`'s 0.4140/0.5860) -> 1.9pp drift.
+        assert!((r.probabilities[1] - 0.5860).abs() < 0.026,
+            "P(B) drift vs `laya serve` must stay inside the accepted 2.6pp, got {}", r.probabilities[1]);
     }
 }

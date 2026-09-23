@@ -24,6 +24,11 @@ pub struct Weights {
     pub temperature_by_qtype: [f32; 3],
 }
 
+/// `laya/common.py`'s `TEMP_MIN` / `TEMP_MAX` — the bounds upstream's `clamp_temperature()`
+/// enforces on every fitted temperature. See [`Weights::temperature`].
+pub const TEMP_MIN: f32 = 0.5;
+pub const TEMP_MAX: f32 = 5.0;
+
 /// Parses `laya.temperature`, which `laya`'s `fill_temperature` accepts as either a 3-element
 /// JSON array or a single number broadcast to all three question types.
 fn parse_temperatures(json: &str) -> [f32; 3] {
@@ -149,15 +154,30 @@ impl Weights {
         }
     }
 
-    /// Temperature for a `(qtype, n_options)` bucket, matching `laya`'s `decode_answer` +
-    /// `temp_bucket` + `softmax_temp` exactly: look the bucket up in `laya.temperature_by_options`,
-    /// fall back to the per-qtype `laya.temperature` entry (NOT 1.0) when the bucket is absent,
-    /// and apply only `max(t, 1e-3)` — no 0.5 floor.
+    /// Temperature for a `(qtype, n_options)` bucket: look the bucket up in
+    /// `laya.temperature_by_options`, fall back to the per-qtype `laya.temperature` entry (NOT
+    /// 1.0) when the bucket is absent, then clamp to `[TEMP_MIN, TEMP_MAX]`.
     ///
-    /// The old `clamp(0.5, 5.0)` was wrong in a way real questions hit: the shipped
-    /// `choice:11+` bucket is 0.100583, so every question with >10 options was scored at T=0.5
-    /// and came out far flatter than `laya serve` (measured: 0.26 absolute probability error on
-    /// a 12-option question).
+    /// # Why the clamp is back (deliberate, and deliberately NOT what `ggmlc` does)
+    ///
+    /// Loop 11 removed this clamp to match `ggmlc`'s `max(t, 1e-3)`. Loop 15's PyTorch
+    /// ground-truth run (`docs/benchmarks/pytorch-ground-truth-reference.md`) showed that is
+    /// backwards with respect to the *original* model: upstream `laya/common.py` defines
+    /// `TEMP_MIN = 0.5`, `TEMP_MAX = 5.0` and a `clamp_temperature()` that every bucket goes
+    /// through, and emits a `RuntimeWarning` naming the bucket it rejects. Its source comment
+    /// explains why, about the shipped `choice:11+` value of 0.1006:
+    ///
+    /// > multiplies [the logits] ~10x: a 0.24 top probability is published as 0.99, so a caller
+    /// > gating on confidence is told a coin flip is a certainty. No honest calibration needs to
+    /// > sharpen this hard, so refuse to apply one that does.
+    ///
+    /// `ggmlc` and upstream Python genuinely disagree here; this crate follows **upstream's
+    /// design intent**, chosen by the user in Loop 13, accepting that it costs bit-for-bit
+    /// agreement with `laya serve` on `choice:11+` questions. Blast radius is exactly that
+    /// bucket: for `k <= 10` the two policies are identical, so all 10 project benchmark
+    /// scenarios are untouched, and no `choice` flips even at k = 11/17/20 — only the published
+    /// confidence changes (ground truth `E1_11opt_bucket_11plus`: 0.9642 clamped vs a dishonest
+    /// 1.0000 raw).
     pub fn temperature(&self, qtype_name: &str, k: usize) -> f32 {
         let size = if k <= 2 { "2" } else if k <= 5 { "3-5" } else if k <= 10 { "6-10" } else { "11+" };
         let needle = format!("\"{qtype_name}:{size}\":");
@@ -175,6 +195,6 @@ impl Weights {
                 rest[..end].trim().parse::<f32>().ok()
             })
             .unwrap_or(default);
-        t.max(1e-3)
+        t.clamp(TEMP_MIN, TEMP_MAX)
     }
 }

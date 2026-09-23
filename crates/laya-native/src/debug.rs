@@ -2,17 +2,18 @@
 //! layer by layer. Nothing here runs unless the corresponding variable is set — no log spam,
 //! no cost on the normal path.
 //!
-//! # Crate status (as of Loop 12) — a baseline to beat, not a closed question
+//! # Crate status (as of Loop 13) — parity, and the profile says that is structural
 //!
 //! Loop 11 found production's `laya serve` had been built with an empty `CMAKE_BUILD_TYPE`
 //! (no `-O3`) since Loop 5. Loop 12 rebuilt and deployed `ggmlc` correctly
 //! (`-DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=ON`), which moved production from ~1262ms to the
-//! ~90-160ms class. Against that corrected C++ baseline this crate currently measures **95.1ms
-//! vs 92.7ms — roughly 3% slower, i.e. parity, not a win**. That is a *measurement of where this
-//! crate stands today*, not a verdict that the native Rust path is finished or abandoned:
-//! Loop 13+ continues optimising it (fewer graph nodes, tighter memory/allocation behaviour,
-//! kernel-level experiments) with the explicit goal of beating the `-O3` C++ number, after which
-//! wiring it into `apps/server`/`apps/cli` gets reconsidered on that evidence.
+//! ~90-160ms class and left this crate at parity (95.1 vs 92.7ms).
+//!
+//! Loop 13 profiled rather than guessed, cut graph nodes 1430 -> 1076 and arena use -32% (all
+//! bit-exact), and still measures **parity: 88.4ms vs 87.6ms median**, interleaved. The profile
+//! explains why — 99.7% of the latency is inside one `ggml_graph_compute` running the same C
+//! kernels as `ggmlc`. See the crate-level docs in `lib.rs` and
+//! `docs/benchmarks/server-tuning-results.md` (Loop 13). Wiring into `apps/*` stays gated.
 //!
 //! Every hook below is deliberately **kept**, not cleaned up: getting the graph numerically
 //! identical to `ggmlc` was hard, and these are the tools that made it possible — they are the

@@ -21,7 +21,7 @@
 //!   (`GGML_OP_CUSTOM_BIAS_GELU`, i.e. `gelu(x + b)`), so it is *not* a double-add. Checked
 //!   numerically: `gelu_tanh(linear_120 + scorer_fc1.bias)` reproduces the reference's `gelu_28`
 //!   to 3.5e-8 L2-relative, while omitting the bias is off by 1.1e-2.
-use crate::attn::{sdpa, split_head};
+use crate::attn::{sdpa, split_head, split_head_view};
 use crate::gguf::Weights;
 use crate::graph::{D, EPS, HEAD_LAYERS};
 use llama_cpp_sys_2 as s;
@@ -54,7 +54,7 @@ pub unsafe fn build(
             ctx,
             split_head(ctx, qkv, seq, 0),
             split_head(ctx, qkv, seq, 1),
-            split_head(ctx, qkv, seq, 2),
+            split_head_view(ctx, qkv, seq, 2),
             mask,
             seq,
         );

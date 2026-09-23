@@ -6,3 +6,4 @@ Cargo.lock
 *.log
 .DS_Store
 *.gguf
+.claude/settings.local.json

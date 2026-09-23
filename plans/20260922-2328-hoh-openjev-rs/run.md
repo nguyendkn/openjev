@@ -159,6 +159,32 @@ unit tests for `pipeline::generate` and `apps/server`, covered instead by extens
 end-to-end/curl evidence across every loop), G14 (port 80 instead of 8080, accepted deviation
 — external firewall layer outside VM control), G16 (a stale line in a docs ASCII diagram).
 
+**Loop 17 (delivered, feature REJECTED after rigorous investigation): KV-cache prefix/session
+reuse is not viable on this stack — proven, not assumed, and closed by explicit user
+decision.** First corrected a wrong premise in its own brief: `readout`/`generate` do NOT
+decode an identical prompt (D_17 assumed this) — they share a 65% prefix (48/74 tokens) then
+diverge on the trailing instructions. Implemented prefix reuse via `kv_cache_seq_rm` (in-place
+truncation, the leaner of the two APIs `llama-cpp-2` exposes). **Bit-exact validation failed**:
+19/33 benchmark-matrix cases changed `generate` output, 5 of them materially (a different final
+answer, not just token-count noise). Root-caused with a rigorous control experiment (not
+guessed): `llama.cpp`'s CPU path (`-march=native`, AVX-512 tinyBLAS) is **not batch-split-
+invariant** — decoding the same tokens as one batch vs. two yields slightly different f32
+logits (kernel tiling depends on batch size), and greedy generation amplifies that into
+different token streams/answers. Proved the KV-reuse mechanism itself adds zero extra error
+(an isolated split-vs-unsplit probe reproduces bit-identical numbers to the reuse path) — the
+failure is structural to CPU batch decoding on this hardware/build, not an implementation bug,
+and therefore applies to ANY prefix/session-reuse scheme regardless of which `llama-cpp-2` API
+is used. Measured real benefit: only **0.57-0.87% of total request time** (46-265ms saved on
+prefill, dwarfed by the multi-second generation loop). Correctly skipped the smaller stretch
+goal (ChatML-header cross-request caching) since it's dominated by the same failure mode for an
+even smaller (~0.05%) prize. **User decision (2026-09-23): close this feature, do not apply** —
+unlike Loop 13's `seq_align` (which never changes the winning answer), this trade would risk
+genuinely wrong answers for under 1% speed gain, not a good trade even under this project's
+aggressive-optimization mandate. Tree fully reverted, verified byte-identical to pre-loop state
+via checksum (no git on the server); a ready-to-apply patch is parked at `/tmp/loop17/patch/`
+on the server if ever reconsidered, but not applied. Full regression (G13 per-worker,
+Laya-outage, G17/G18, 3 models × 3 methods) confirmed clean on the untouched production stack.
+
 ## Extended goal (2026-09-23): beat Jev's latency, not just match it
 
 New user directive after the original 6-item DoD was met: current performance still "too low"
@@ -298,9 +324,51 @@ loading (already enabled by default, no work needed), request batching (high-eff
 deferred), SSD (not the bottleneck, skipped). Recommendation: multi-worker pool, benchmark
 topology empirically first — Loop 14 implementing.
 
-**Loop 13 (in progress): pushing `crates/laya-native` past the 92.7ms C++ baseline**, using
-the Loop 11b perf logger to find real hotspots. Also now carrying the temperature-clamp
-correctness fix from Loop 15's finding (see below).
+**Loop 13 (delivered): honest conclusion — parity with C++, not a win, for a well-understood
+structural reason; found a real 2x via a different lever instead.** Using the Loop 11b perf
+logger: **99.7% of latency is inside a single `ggml_graph_compute` call** — both the Rust
+wrapper and `ggmlc`'s C++ call the *same* `ggml` C kernels over materially the same graph; the
+Rust-side code (tokenize, fill inputs, decode) totals <0.3ms of ~88ms. Six optimizations tried,
+reported honestly including the ones that didn't help: head-major attention layout + `ggml_geglu`
+fusion cut graph nodes 1430→1076 (−25%) with zero measurable speedup (proving the win, if any,
+isn't in node count); a persistent `ggml_cplan` work buffer (replacing per-call arena
+bump-allocation) gave a real but modest ~2-3% AND fixed a genuine defect (unbounded arena growth
+— a slow memory leak — in the old per-call-realloc pattern, now fixed); thread sweep confirmed
+28 is already optimal (matches Loop 6's finding for the LLM engine); `OMP_PROC_BIND=spread`'s
+apparent ~10% win did not hold across repeated interleaved rounds (correctly reported as
+unproven, not banked). Final interleaved head-to-head: Rust 88.4ms median vs C++ 87.6ms median
+— parity, restating Loop 12's conclusion with 25% fewer graph nodes, not a reversal.
+**Recommendation taken to heart: stop treating "beat ggmlc via implementation effort" as
+reachable — beating it requires changing the actual computation, not the wrapper.**
+
+**The real 2x that was found**: tighter sequence padding (`seq_align`, pads to any multiple
+instead of fixed buckets) — reference case 64→32 tokens, ~2x measured. Breaks bit-exact parity
+with `laya serve` (probabilities shift up to 2.6pp; choice never flips across every tested
+scenario) — this failed D_13's original <1e-4 gate, so Loop 13 correctly left it OFF by default
+and escalated the trade-off. **User decision (2026-09-23): turn it ON — speed prioritized over
+bit-exact parity, given the winning answer never changes.** Applied as the new default,
+relayed to Loop 13 to finalize + document as an explicit user choice, not a bug.
+
+**Temperature-clamp fix (relayed from Loop 15) applied and verified**: restored `[0.5, 5.0]`
+clamp with a code comment citing `laya/common.py`'s original reasoning. Verified against Loop
+15's edge cases — `E1` (k=11) confidence now `0.9717` (not falsely `1.0000`), matching the
+Python-clamped ground truth (`0.9642`) far more closely; no `choice` changed anywhere across
+all 10 scenarios + edge cases. Also surfaced (not a bug, a real GGUF export limitation, separate
+from G21's safety fix): the exported GGUF hard-caps `max_opts=16`, so k≥17 questions can never
+be scored by this crate even though the original PyTorch model has no such limit — documented,
+out of scope to fix (would require re-exporting/recompiling the GGUF itself).
+
+**Two process lessons disclosed, both real and worth remembering**:
+1. Loop 13's own thread-sweep contributed to a CPU overload moment (self-corrected immediately
+   with `taskset`/`nice`, confirmed the bulk of that specific spike was actually Loop 14's
+   `topology_probe` via CPU% evidence — an honest, evidence-based apportionment, not
+   finger-pointing).
+2. **Shared `target/` build directory hazard**: another agent's `cargo build` in the shared
+   `/tmp/openjev/target` silently overwrote Loop 13's `GGML_NATIVE=ON` build artifacts mid-loop,
+   changing measured probabilities (`0.4140→0.3973`) until caught by recognizing the reference
+   signature had drifted. **Lesson for all future loops on this server: use a dedicated
+   `CARGO_TARGET_DIR` per concurrent workstream, never share `target/` across simultaneously-
+   running loops that both build native code.**
 
 **Loop 14 (delivered): multi-worker pool live in production, throughput genuinely improved.**
 Empirical topology benchmark (real data, not assumed) confirmed the hypothesis decisively:

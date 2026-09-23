@@ -4,21 +4,41 @@ use crate::gguf::Weights;
 use crate::graph::{D, HD, NH};
 use llama_cpp_sys_2 as s;
 
-/// `qkv` is `[3D, seq]` F32 contiguous -> a `[HD, NH, seq]` view of one of its three slices.
+/// `qkv` is `[3D, seq]` F32 contiguous -> a contiguous `[HD, seq, NH]` copy of one of its three
+/// slices, i.e. already in the head-major layout `ggml_flash_attn_ext` consumes.
+///
+/// D_13: this used to produce `[HD, NH, seq]` and leave `sdpa` to `cont(permute(.., 0,2,1,3))` it
+/// into head-major, i.e. **two** full `[D, seq]` copies per q/k/v per layer. Strided `ggml_view_3d`
+/// can express the head-major layout directly out of the `[3D, seq]` qkv block, so one of the two
+/// copies (and its graph node, and its OpenMP barrier) is pure waste. Element `(h, t, nh)` sits at
+/// float offset `part*D + t*3D + nh*HD + h`, hence `nb1 = 3D*4` (token stride) and `nb2 = HD*4`
+/// (head stride). Values are bit-identical — only the copy schedule changes.
 pub unsafe fn split_head(
     ctx: *mut s::ggml_context,
     qkv: *mut s::ggml_tensor,
     seq: i64,
     part: i64,
 ) -> *mut s::ggml_tensor {
-    s::ggml_cont(
-        ctx,
-        s::ggml_view_3d(ctx, qkv, HD, NH, seq, (HD * 4) as usize, (3 * D * 4) as usize, (part * D * 4) as usize),
-    )
+    s::ggml_cont(ctx, split_head_view(ctx, qkv, seq, part))
 }
 
-/// The GGUF's baked cos/sin table for `name`, sliced to `seq` positions and shaped `[HD, 1, seq]`
-/// so `ggml_mul` broadcasts it across the head dimension.
+/// The same slice, left as a strided view. V needs no RoPE and `sdpa` only casts it to F16, and
+/// `ggml_cast`'s dup kernel reads arbitrary strides — so V can skip the materialising `ggml_cont`
+/// entirely and fuse gather+convert into the one node.
+pub unsafe fn split_head_view(
+    ctx: *mut s::ggml_context,
+    qkv: *mut s::ggml_tensor,
+    seq: i64,
+    part: i64,
+) -> *mut s::ggml_tensor {
+    s::ggml_view_3d(ctx, qkv, HD, seq, NH, (3 * D * 4) as usize, (HD * 4) as usize, (part * D * 4) as usize)
+}
+
+/// The GGUF's baked cos/sin table for `name`, sliced to `seq` positions -> `[HD, seq]`.
+///
+/// Left 2-D on purpose: against a head-major `[HD, seq, NH]` operand this already has the trailing
+/// `ne[2] = 1` that `ggml_mul`'s repeat-broadcast needs, so the extra `ggml_reshape_3d` the
+/// `[HD, NH, seq]` layout required (4 more graph nodes, 4 more barriers, zero arithmetic) is gone.
 pub unsafe fn rope_table(
     ctx: *mut s::ggml_context,
     w: &Weights,
@@ -26,8 +46,7 @@ pub unsafe fn rope_table(
     seq: i64,
 ) -> Result<*mut s::ggml_tensor, String> {
     let t = w.expect(name, &[HD, 513], s::GGML_TYPE_F32)?;
-    let rows = s::ggml_cont(ctx, s::ggml_view_2d(ctx, t, HD, seq, (HD * 4) as usize, 0));
-    Ok(s::ggml_reshape_3d(ctx, rows, HD, 1, seq))
+    Ok(s::ggml_cont(ctx, s::ggml_view_2d(ctx, t, HD, seq, (HD * 4) as usize, 0)))
 }
 
 /// RoPE done exactly the way the reference graph does it: with the GGUF's **baked** F32 cos/sin
@@ -41,21 +60,22 @@ pub unsafe fn rope_table(
 /// 2.25e-6 to 9.2e-8 L2-relative vs `ggmlc`, and the layer-0 output projection became bit-exact.
 pub unsafe fn rope_baked(
     ctx: *mut s::ggml_context,
-    x: *mut s::ggml_tensor, // [HD, NH, seq]
+    x: *mut s::ggml_tensor, // [HD, seq, NH]
     cos: *mut s::ggml_tensor,
     sin: *mut s::ggml_tensor,
     seq: i64,
 ) -> *mut s::ggml_tensor {
     let half = HD / 2;
     let (nb1, nb2) = ((*x).nb[1], (*x).nb[2]);
-    let lo = s::ggml_cont(ctx, s::ggml_view_3d(ctx, x, half, NH, seq, nb1, nb2, 0));
-    let hi = s::ggml_cont(ctx, s::ggml_view_3d(ctx, x, half, NH, seq, nb1, nb2, (half * 4) as usize));
+    let lo = s::ggml_cont(ctx, s::ggml_view_3d(ctx, x, half, seq, NH, nb1, nb2, 0));
+    let hi = s::ggml_cont(ctx, s::ggml_view_3d(ctx, x, half, seq, NH, nb1, nb2, (half * 4) as usize));
     // rotate_half(x) = cat(-x[HD/2..], x[..HD/2])
     let rot = s::ggml_concat(ctx, s::ggml_neg(ctx, hi), lo, 0);
     s::ggml_add(ctx, s::ggml_mul(ctx, x, cos), s::ggml_mul(ctx, rot, sin))
 }
 
-/// q/k/v -> `softmax(QK^T / sqrt(HD) + mask) V`, returned as `[D, seq]`.
+/// q/k/v (each already head-major `[HD, seq, NH]`, see [`split_head`]) ->
+/// `softmax(QK^T / sqrt(HD) + mask) V`, returned as `[D, seq]`.
 ///
 /// Deliberately `ggml_flash_attn_ext` with K/V cast to F16, because that is exactly what the
 /// `ggmlc` runtime does for head_dim=64 (`runtime/src/executor.cpp`, `is_fattn_supported`) — the
@@ -68,9 +88,8 @@ pub unsafe fn sdpa(
     mask: *mut s::ggml_tensor,
     seq: i64,
 ) -> *mut s::ggml_tensor {
-    let q = s::ggml_cont(ctx, s::ggml_permute(ctx, q, 0, 2, 1, 3)); // [HD, seq, NH]
-    let k = s::ggml_cast(ctx, s::ggml_cont(ctx, s::ggml_permute(ctx, k, 0, 2, 1, 3)), s::GGML_TYPE_F16);
-    let v = s::ggml_cast(ctx, s::ggml_cont(ctx, s::ggml_permute(ctx, v, 0, 2, 1, 3)), s::GGML_TYPE_F16);
+    let k = s::ggml_cast(ctx, k, s::GGML_TYPE_F16);
+    let v = s::ggml_cast(ctx, v, s::GGML_TYPE_F16);
     let o = s::ggml_flash_attn_ext(ctx, q, k, v, mask, 1.0 / (HD as f32).sqrt(), 0.0, 0.0);
     s::ggml_reshape_2d(ctx, o, D, seq) // [HD, NH, seq] -> [D, seq]
 }

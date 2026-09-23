@@ -757,3 +757,199 @@ See the Loop 12 evidence file for raw output. Summary:
 - G10 / G12 / G14 / G16 / G2 / G11 — unchanged, carried from prior loops.
 - The finer-grained LLM-engine `n_threads` sweep (20/24/26) remains untested, unchanged since
   Loop 7.
+
+---
+
+# Loop 13 — `crates/laya-native` single-request latency: 2.07x, but not the way D_13 expected
+
+**Headline:** at equal padding the Rust crate is at **parity** with the C++ `laya serve`
+(88.4 vs 87.6 ms median) and −25% graph nodes bought nothing — §1 explains why that is structural.
+The **2.07x that shipped** (45.7 vs 94.5 ms median) comes from §5's tighter sequence padding, a
+user-approved trade of bit-parity for speed, not from out-executing `ggmlc`.
+
+Standalone work on `crates/laya-native` only. `openjev-server` and `laya serve` were untouched;
+the crate is still **not** wired into `apps/*`.
+
+## 1. Where the time actually goes (D_13 Task 2 — measured, not guessed)
+
+Two independent instruments, both on the real reference question (`n_tokens=28`, padded `seq=64`).
+
+**`timing::perf_span!` spans** (D_13 Task 1 — `PERF_LOG=1`, via `scripts/analyze-perf-logs.sh`):
+
+| span | count | mean µs | p50 µs |
+|---|---|---|---|
+| `laya_native::graph::compute` | 40 | 89584 | 81502 |
+| `laya_native::score` | 29 | 88811 | 81041 |
+| `laya_native::graph::build` (one-off per bucket) | 3 | 3346 | 3399 |
+| `laya_native::score::encode` (tokenize) | 29 | 245 | 190 |
+| `laya_native::score::ensure_graph` | 29 | 241 | **2** |
+| `laya_native::score::fill_inputs` | 29 | 16 | 15 |
+| `laya_native::score::decode` (softmax/argmax) | 29 | 10 | 10 |
+
+**The single `ggml_graph_compute` call is 99.7% of request latency.** Everything written in Rust —
+BPE tokenization, the O(seq²) mask fill, softmax/argmax — sums to **under 0.3 ms of ~88 ms**.
+
+**`perf record` on the same binary** (flat, `--no-children`):
+
+| symbol | share |
+|---|---|
+| `tinyBLAS_Q0_AVX::gemm4xN<4>` (Q8_0 GEMM) | 34.9% |
+| `libgomp` spin/barrier (5 addresses summed) | ~39.7% |
+| `native_queued_spin_lock_slowpath` + page-fault path | ~9.5% |
+| `ggml_compute_forward_flash_attn_ext_tiled` | 4.8% |
+
+This reframed the whole loop: there is no Rust-side overhead left to remove, and the ~35% that is
+real arithmetic runs the *same C kernels* `ggmlc`'s `laya` runs. Only the ~40% synchronization and
+~9.5% page-fault shares were ever addressable from this crate.
+
+## 2. What was changed (each validated separately, bit-exactness required)
+
+Graph nodes went **1430 → 1076 (−25%)** and arena use **352 → 240 MiB at seq=64 (−32%)**.
+
+| # | change | nodes | correctness |
+|---|---|---|---|
+| 1 | `split_head` emits head-major `[HD, seq, NH]` straight out of the strided qkv view, so `sdpa` no longer does a second `cont(permute(...))`; V skips its `cont` entirely (`ggml_cast` reads strides); `rope_table` drops 4 no-op reshapes | 1430→1216 | bit-exact |
+| 2 | `ggml_geglu` replaces slice-gate + slice-up + `ggml_gelu` + `ggml_mul` (`ggml_vec_geglu_f32` is literally the same gelu table lookup times the same f32 multiply) | 1216→1076 | bit-exact |
+| 3 | Persistent `ggml_cplan` work buffer instead of `ggml_graph_compute_with_ctx` | — | bit-exact |
+
+Change 3 also fixes a **real defect**: `ggml_graph_compute_with_ctx` does
+`cplan.work_data = ggml_new_buffer(ctx, work_size)` on *every* call, so each forward pass
+bump-allocated fresh never-faulted scratch out of the graph arena — the page-fault share above —
+and the arena grew without bound across requests. Harmless in a one-shot probe, a slow leak in a
+long-lived server.
+
+**Correctness gate, every change:** all 10 benchmark scenarios `diff`-identical to 4 d.p., the
+reference case still `A=0.4140 B=0.5860 conf=0.0215`, and `last_hidden[CLS]` identical to the
+last float.
+
+## 3. Honest result: the 92.7 ms baseline was NOT beaten
+
+Final measurement, `laya serve` and the Rust probe **interleaved in 6 alternating rounds** so both
+see the same background drift (this box is a 32-vCPU VM; single-batch numbers move ±40%):
+
+| | n | min | p10 | median | mean | p95 |
+|---|---|---|---|---|---|---|
+| C++ `laya serve` (its own `usage.latency_ms`) | 60 | 70.8 | 74.5 | **87.6** | 94.0 | 126.0 |
+| Rust `laya-native`, default OpenMP | 6 round-medians | 82.3 | — | **88.4** | 102.2 | — |
+| Rust `laya-native`, `OMP_PROC_BIND=spread` | 6 round-medians | 79.1 | — | **92.8** | 98.8 | — |
+
+**Parity, not a win** — the same verdict Loop 12 reached (95.1 vs 92.7), now with the Rust side
+25% lighter in graph nodes. The C++ reference re-measured at 87.6 ms median today, consistent with
+the recorded 92.7 ms, which validates the methodology rather than moving the goalposts.
+
+**These rows are the bit-parity configuration (`seq_align = 0`).** The crate's *shipped* default
+is now the tighter padding of §5, which lands the reference question at **45.7 ms median vs the
+C++ 94.5 ms — 2.07x**. That win comes from doing less padded work, not from executing the same
+work faster; at equal padding the two are dead level. Both numbers are real and they answer
+different questions, so §3 and §5 are reported separately rather than merged — conflating them is
+exactly the move D_13 Task 4 warned against.
+
+The structural reason is §1: both binaries run the same ggml kernels over the same graph, and the
+Rust-side wrapper is 0.3% of the time. Beating `ggmlc` requires changing *what the kernels compute*,
+not how they are called.
+
+## 4. Candidates tried that did NOT pay off (recorded so they are not retried blind)
+
+- **Graph-node reduction (D_13 candidate 1).** −25% nodes produced **no measurable wall-clock
+  gain** — best-case time was ~77 ms before and after. The ~40% `libgomp` share is load imbalance
+  *inside* the big GEMM nodes, not per-node barrier cost, so deleting cheap nodes does not touch it.
+- **Thread count (candidate 6).** Swept 8/16/20/24/28/32. Latency falls monotonically to 28 and is
+  flat-to-noisy at 32 (which also oversubscribes the 32 vCPUs). **28 is already right**; the Loop
+  6-8 tuning transfers to this smaller workload after all.
+- **Debug scaffolding (candidate 4).** Measured, not assumed: the `LAYA_*` env hooks are all
+  evaluated inside `Graph::build` (one-off, 3.3 ms total) except one `LAYA_RS_DUMP` check per
+  `score`. Runtime cost is `fill_inputs`+`decode` = **26 µs**. A `cfg(feature)` gate would buy
+  nothing; the hooks stay as they are.
+- **`ggml_rope_ext` (candidate 3).** Not retried: Loop 11 already measured it at 2.6e-6 from the
+  baked tables, which Q8_0 re-quantization amplifies. It would trade the correctness this crate
+  was built for against ~6 nodes per layer.
+- **OpenMP placement.** `OMP_PROC_BIND=spread OMP_PLACES=cores` looked like a ~10% win and a large
+  tail reduction (p95 107 vs 1825 ms) in one batch, but did **not** hold up over 6 interleaved
+  rounds (92.8 vs 88.4 median). Recorded as unproven, not as a win.
+
+## 5. The real 2x — ON by default, by explicit user decision (2026-09-23)
+
+**Sequence padding (candidate 5).** `laya serve` rounds every request up to `[64,128,256,512]`, so
+the 28-token reference question pays for 64 tokens; encoder cost is near-linear in padded length.
+`LayaNative::seq_align` pads to any multiple instead:
+
+| padding | padded seq | median ms | min ms |
+|---|---|---|---|
+| buckets (align 0) | 64 | 119.6 | 89.0 |
+| align 32 / 16 / 8 | 32 | 59.5 / 63.0 / 65.0 | 47.2 / 46.7 / 48.4 |
+
+**The user chose speed over bit-parity via AskUserQuestion, so `DEFAULT_SEQ_ALIGN = 16` is now the
+crate default.** This is a deliberate, documented trade — *not* a bug and not a regression that
+someone should "fix" by reverting it:
+
+- **Gain: ~2x** on typical short questions. Reference question median 119.6 → 59.5 ms, min 89.0 →
+  46.7 ms; padded length 64 → 32.
+- **Cost: probabilities drift by at most 2.6 pp** vs `laya serve` (worst measured:
+  `6_content_moderation` ban-user 0.5534 → 0.5796; the reference question moves
+  0.4140/0.5860 → 0.3949/0.6051, i.e. 1.9 pp). Cause is understood and benign: a different token
+  count dispatches a different tinyBLAS GEMM tiling, hence a different float summation order,
+  which Q8_0 activation re-quantization amplifies — the same 1-ULP mechanism already documented
+  for `-march=native` and `-O0`/`-O3`. Outputs differ **iff** the padded length differs, exactly
+  as that explanation predicts.
+- **The winning option never changes.** Re-verified across all 10 project benchmark scenarios at
+  align 32/16/8: **10/10 identical `choice`**, only the probability/confidence vectors move.
+
+Loop 15's PyTorch ground truth neither supports nor refutes the trade — tighter padding is closer
+to fp32 on 3 scenarios and further on 3, i.e. it reshuffles inside the Q8_0 noise band. (Upstream
+PyTorch does not pad at all: `seq_len == input_tokens`.)
+
+### Final state as shipped — 2.07x vs the C++ baseline
+
+Re-measured after flipping the default, same interleaved protocol, 3 rounds:
+
+| | n | min | median | mean |
+|---|---|---|---|---|
+| C++ `laya serve` | 45 | 84.1 | **94.5** | 101.1 |
+| Rust, shipped default (`seq_align = 16`, seq 32) | 3 × 15 | 43.6 | **45.7 / 46.0 / 45.7** | 46.9 / 50.9 / 45.9 |
+
+**2.07x on median**, and far steadier (p95 48-59 ms in two of three rounds against a C++ mean of
+101 ms). Per-scenario padded lengths at the default: 48/32/48/64/64/48/48/64/48/64 — five of the
+ten scenarios shrink, the rest already needed a full 64.
+
+Verified at this exact default: **10/10 scenarios keep the same `choice`**, maximum probability
+drift **2.62 pp** (`6_content_moderation` ban-user 0.5534 → 0.5796) — inside the accepted envelope.
+Reference question: seq 64 → 32, `A=0.4140 B=0.5860` → `A=0.3949 B=0.6051`, still choice B.
+`LAYA_SEQ_ALIGN=0` reproduces the pre-Loop-13 build bit-for-bit, confirmed by `diff`.
+
+**Consequence to carry forward:** D_13's "<1e-4 match with `ggmlc`" gate no longer holds at the
+default, by design. Bit-parity is still available and still tested — set `seq_align = 0`, which is
+exactly what `tests/sequence_and_reference.rs::reference_question_picks_b_with_28_tokens` pins so
+the kernel-level agreement Loop 11 achieved keeps a regression guard;
+`reference_question_at_default_padding` covers the shipped path (seq 32, choice B, drift inside
+2.6 pp).
+
+## 6. Temperature clamp restored (out-of-band correctness fix, user decision)
+
+`gguf::Weights::temperature` went back to `clamp(0.5, 5.0)` from `max(t, 1e-3)`, per the user's
+AskUserQuestion decision on Loop 15's ground truth: upstream `laya/common.py` defines
+`TEMP_MIN`/`TEMP_MAX` and deliberately refuses the shipped `choice:11+` value of 0.1006. Verified
+against `docs/benchmarks/pytorch-ground-truth-reference.md`:
+
+| case | k | T | choice | our conf | PyTorch fp32 clamped |
+|---|---|---|---|---|---|
+| `E1_11opt_bucket_11plus` | 11 | 0.5000 (clamped from 0.1006) | audio-volume-down ✓ | 0.9717 | 0.9642 (raw policy would say 1.0000) |
+| `E4_2opt_binary_risk` | 2 | 1.9064 | unsafe ✓ | 0.1770 | 0.1754 |
+| `E2_17opt` / `E3_20opt` | 17 / 20 | — | **refused** by G21 (`laya.max_opts=16`) | — | PyTorch has no such cap |
+
+All 10 benchmark scenarios are unaffected (the two policies are identical for k ≤ 10) and no
+`choice` changes anywhere — as Loop 15 predicted. This intentionally costs bit-parity with `ggmlc`
+on `choice:11+` only.
+
+## 7. Remaining gaps after Loop 13
+
+- **At equal padding it is still parity, not a win.** §1 shows both paths run identical kernels, so
+  that gate may be unreachable by implementation effort alone. The end-to-end 2x now shipped comes
+  from §5 (doing less work), not from out-executing `ggmlc`. Wiring into production stays gated on
+  a coordinator decision, not on further optimization.
+- **`seq_align` is now on by default**, so `crates/laya-native` no longer matches `laya serve`
+  bit-for-bit. Anything that diffs the two must pin `seq_align = 0` first.
+- **`E2`/`E3` (k=17/20) cannot be scored at all** — the GGUF export caps `laya.max_opts` at 16
+  while upstream PyTorch handles k=20 fine. Not a `laya-native` bug; a model-export limitation.
+- **`act_head`** — still unimplemented, still out of scope.
+- **Measurement noise on this box is the binding constraint** for anything under ~10%: a 32-vCPU
+  VM with a live `openjev-server` alongside. Interleaved rounds are the mitigation used here.
