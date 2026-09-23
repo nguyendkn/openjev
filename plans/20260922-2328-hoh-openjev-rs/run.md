@@ -339,6 +339,61 @@ validity without the correctness trade-off if fixed; (3) MiniCPM5-2B's
 flip is likely a mislabeled expected-answer, not a code bug — low priority to chase
 further. Uncommitted at handback: 7 source files + 1 new doc — Runtime to commit.
 
+**Loop 20 (delivered, DEPLOYED, genuine 3-axis win, no forced trade-off): partial-CoT
+token-budget forcing resolves Qwen3-0.6B's dilemma cleanly.** Runtime-verified
+independently (SSH: `systemctl is-active` all 3 services = active, `/health` = 200,
+registry has `think_budget: Option<usize>` with `THINK_BUDGET_QWEN3_0_6B` set for
+qwen3-0.6b / `None` for the other 3, deployed binary md5 `9f4b8d0a...` matches the
+report, and the pre-deploy backup md5 `5ef391ea...` exactly matches Loop 19's own
+documented deployed-binary md5 — confirms production was genuinely untouched between
+loops, not just claimed).
+
+- **Technique**: bounded token-budget forcing (let Qwen3-0.6B think naturally up to a
+  cap, then inject `</think>\n\n` as real decoded tokens and resume normal sampling) —
+  chosen over NOWAIT-style logit-bias suppression (confirmed technically viable via
+  `LlamaSampler::logit_bias`, real API, but deferred: budget-forcing gives a hard
+  verifiable ceiling matching the dev-doc's calibration-sweep design, avoids unvalidated
+  Qwen3-filler-token-id research, avoids doubling sweep compute on the shared prod box).
+  New `ModelEntry::think_budget: Option<usize>` registry field (not hardcoded), only
+  set for Qwen3-0.6B — the other 2 models' Loop 18/19 policy is untouched.
+- **Real budget sweep** (10 scenarios each, caught+fixed a real bug in its own
+  calibration harness first — a jq filter silently dropped 1/10 scenarios for an
+  empty-string edge case, re-ran `None` baseline from scratch after the fix):
+
+  | think_budget | valid/10 | correct/9 | mean gen_ms | forced-close |
+  |---|---|---|---|---|
+  | Loop 18 (full suppress) | 10/10 | 3/9 | 632 | n/a |
+  | Loop 19 (no suppress) | 7/10 | 5/9 | 7,133 | n/a |
+  | 150 | **10/10** | **6/9** | **2,486** | 10/10 |
+  | 300 | 10/10 | 6/9 | 4,144 | 5/10 |
+  | 450 | 10/10 | 6/9 | 5,013 | 3/10 |
+
+  **150 dominates 300/450 outright** (identical valid+correct, meaningfully faster) and
+  **beats both Loop 18 and Loop 19 simultaneously on all 3 axes vs Loop 19** (more
+  valid, more correct, 2.9x faster) — not a 2-of-3 trade-off, a clean win. Vs Loop 18:
+  ties JSON validity, doubles correctness (6/9 vs 3/9), costs ~3.9x latency but stays
+  well under 3s. This closes Loop 19's open gap #1 (the ~7.1s Qwen3-0.6B latency) with a
+  genuinely better point than either prior loop's binary extremes — no forced/inflated
+  result, the dev-doc's "report honestly if no win exists" instruction simply wasn't
+  needed this time.
+- **Deployed** with full backup/rollback (md5-verified chain, confirmed unbroken back
+  through Loop 19).
+- **Full regression clean**, including the now-routine live Laya-outage drill
+  (recovered within 1s) and G13 on an isolated scratch copy (never the live artifact).
+  `cargo test --workspace` 8/8 pass. Qwen3-4B/MiniCPM5-2B spot-checked byte-identical to
+  Loop 19 (unaffected, as scoped).
+- Doc: `docs/benchmarks/generation-pipeline-tuning.md` Loop 20 section.
+
+**Remaining open items (all low-priority, none blocking)**: NOWAIT logit-bias
+suppression not implemented/compared (confirmed viable, real follow-up only if 2.5s is
+still judged too slow); budget values below 150 untested (150 already dominated
+300/450, so a lower value's marginal value looks small); the 2 security/compliance
+readout-vs-generate flips from Loop 19 (Qwen3-4B `jailbreak_detection`, MiniCPM5-2B
+`compliance_gating`) still open; Laya F16 swap still blocked on `crates/laya-native`'s
+hardcoded Q8_0; the vendored `llama-cpp-sys-2` grammar-engine SIGABRT (Loop 19) not
+root-caused upstream. None of these are regressions or active problems — all are
+optional future work.
+
 ## Extended goal (2026-09-23): beat Jev's latency, not just match it
 
 New user directive after the original 6-item DoD was met: current performance still "too low"

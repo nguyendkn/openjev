@@ -23,6 +23,12 @@ use serde_json::Value;
 // full 768 tokens without landing on `{"answer": ...}`.
 pub const MAX_TOKENS: usize = 768;
 
+// Loop 20: the literal force-close text, factored out to a constant since it's now injected
+// from two call sites in spirit (Loop 18's prompt-time seed for `suppress_think: true` models
+// stays inline below; this one is the mid-generation version used by the `think_budget` path).
+// Byte-identical to Loop 18's seed text -- same mechanism, different injection point.
+const FORCE_CLOSE_THINK: &str = "</think>\n\n";
+
 #[derive(Debug, Clone, Serialize)]
 pub struct GenerateResult {
     /// Raw model output after `<think>...</think>` stripping, before JSON parsing.
@@ -32,6 +38,12 @@ pub struct GenerateResult {
     /// True iff `parsed` is `Some` (i.e. valid JSON matching the option schema).
     pub valid: bool,
     pub tokens_generated: usize,
+    /// Loop 20: true iff a `think_budget` was configured, the model opened a `<think>` block,
+    /// and generation hit the budget before the model closed it naturally -- i.e. this
+    /// request's `</think>` was force-injected rather than model-emitted. Always `false` when
+    /// `think_budget` is `None` or `suppress_think` is `true` (nothing to force). Surfaced for
+    /// calibration/diagnostics, not consumed by the JSON-validity/correctness logic itself.
+    pub think_budget_forced: bool,
 }
 
 /// Strips `<think>...</think>` reasoning blocks (Qwen3 "thinking" output) from `text`. Never
@@ -101,20 +113,28 @@ pub fn parse_and_validate(text: &str, options: &[String]) -> Option<Value> {
 /// - `true` (Qwen3-4B, MiniCPM5-2B): Loop 18's behavior, unchanged -- seed a closed, empty
 ///   `<think>\n\n</think>\n\n` right after the chat-templated prompt so the model never emits
 ///   visible reasoning at all. Proven net win (10/10 valid JSON, improved correctness) for
-///   both models; kept as-is.
+///   both models; kept as-is. `think_budget` is ignored in this mode (there is no open
+///   `<think>` block to bound).
 /// - `false` (Qwen3-0.6B): Loop 19's fix -- let the model reason naturally (no seed), since
 ///   Loop 18 found this model's correctness depends on visible CoT (forcing it closed dropped
-///   correct-answer count 5/9 -> 3/9). Recovers correctness to 5/9 (matching the pre-Loop-18
-///   baseline) at the honest cost of JSON validity also reverting to that same pre-Loop-18
-///   baseline (7/10, down from Loop 18's 10/10 for this model) -- see
-///   `docs/benchmarks/generation-pipeline-tuning.md` for why grammar-constrained decoding
-///   (which would have recovered the JSON-validity win without this trade-off) was prototyped
-///   and rejected: it crashes this project's vendored llama.cpp build.
+///   correct-answer count 5/9 -> 3/9).
+///
+/// `think_budget` (Loop 20, only meaningful when `suppress_think` is `false`): `None` keeps
+/// Loop 19's unbounded-within-`MAX_TOKENS` behavior. `Some(n)` lets the model open and reason
+/// inside `<think>...</think>` naturally, but if it hasn't emitted a closing `</think>` after
+/// `n` generated tokens, force-injects the literal `</think>\n\n` (same text as the
+/// prompt-time seed above, injected mid-generation instead) as real decoded/accepted tokens,
+/// then resumes normal greedy sampling for the answer. This never fires before the model has
+/// actually opened a `<think>` block (a model that skips reasoning and goes straight to prose
+/// is left alone -- there's nothing open to force-close). See
+/// `docs/benchmarks/generation-pipeline-tuning.md`'s Loop 20 section for the calibration sweep
+/// that picked the deployed budget value (or established that none beats Loop 19's trade-off).
 pub fn run_generate(
     engine: &mut Engine,
     prompt: &str,
     options: &[String],
     suppress_think: bool,
+    think_budget: Option<usize>,
 ) -> Result<GenerateResult, PipelineError> {
     let mut _s = timing::perf_span!("pipeline::run_generate");
     _s.set("n_options", options.len().to_string());
@@ -159,8 +179,41 @@ pub fn run_generate(
     let mut generated_text = String::new();
     let mut pos = tokens.len() as i32;
     let mut tokens_generated = 0usize;
+    // Loop 20 budget-forcing state. `think_closed` starts pre-true when `suppress_think` seeded
+    // an already-closed block at the prompt, so the budget branch below is a no-op for those
+    // models regardless of `think_budget`'s value.
+    let mut think_opened = false;
+    let mut think_closed = suppress_think;
+    let mut think_budget_forced = false;
 
     for _ in 0..MAX_TOKENS {
+        // Budget check happens before sampling this iteration's token: only once, only when a
+        // `<think>` block is actually open (never fires if the model skipped reasoning) and
+        // not yet closed, and only when the caller configured a budget.
+        if !think_closed && think_opened {
+            if let Some(budget) = think_budget {
+                if tokens_generated >= budget {
+                    let force_tokens = engine
+                        .tokenize_no_bos(FORCE_CLOSE_THINK)
+                        .map_err(|e| PipelineError::Engine(e.to_string()))?;
+                    for ft in &force_tokens {
+                        let piece = engine
+                            .token_to_piece_id(ft.0)
+                            .map_err(|e| PipelineError::Engine(e.to_string()))?;
+                        generated_text.push_str(&piece);
+                        tokens_generated += 1;
+                        logits = engine
+                            .decode_next_id(ft.0, pos)
+                            .map_err(|e| PipelineError::Engine(e.to_string()))?;
+                        pos += 1;
+                    }
+                    think_closed = true;
+                    think_budget_forced = true;
+                    continue;
+                }
+            }
+        }
+
         let next_id = Engine::sample_greedy_from_logits(&logits) as i32;
         if engine.is_eog_id(next_id) {
             break;
@@ -170,6 +223,13 @@ pub fn run_generate(
             .map_err(|e| PipelineError::Engine(e.to_string()))?;
         generated_text.push_str(&piece);
         tokens_generated += 1;
+
+        if !think_opened && generated_text.contains("<think>") {
+            think_opened = true;
+        }
+        if !think_closed && generated_text.contains("</think>") {
+            think_closed = true;
+        }
 
         logits = engine
             .decode_next_id(next_id, pos)
@@ -186,5 +246,6 @@ pub fn run_generate(
         parsed,
         valid,
         tokens_generated,
+        think_budget_forced,
     })
 }

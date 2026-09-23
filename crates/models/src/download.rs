@@ -43,11 +43,22 @@ pub struct ModelEntry {
     /// MiniCPM5-2B, where Loop 18 measured this as a proven net win (10/10 valid JSON,
     /// improved correctness). `false` for Qwen3-0.6B: Loop 18 found this model's
     /// correctness depends on its visible CoT (forcing it closed dropped correct-answer
-    /// count 5/9 -> 3/9), so Loop 19 leaves it on natural CoT and relies on
-    /// grammar-constrained decoding (see `crates/pipeline/src/generate.rs`) for JSON
-    /// validity instead. Unused for the `laya` entry (dead registry path, see its own
-    /// doc comment below) -- set to `false` there as a harmless default.
+    /// count 5/9 -> 3/9), so Loop 19 left it on natural CoT. Unused for the `laya` entry
+    /// (dead registry path, see its own doc comment below) -- set to `false` there as a
+    /// harmless default.
     pub suppress_think: bool,
+    /// Loop 20: bounded/partial-CoT token budget, only meaningful when `suppress_think` is
+    /// `false` (currently only `qwen3-0.6b`). `None` = unbounded natural CoT within
+    /// `pipeline::MAX_TOKENS` (Loop 19's behavior). `Some(n)` = let the model reason
+    /// naturally inside its own `<think>...</think>` block for up to `n` generated tokens;
+    /// if it hasn't closed `</think>` by then, `pipeline::run_generate` force-injects
+    /// `</think>\n\n` (the same literal Loop 18 used to suppress thinking entirely, just
+    /// applied mid-generation instead of at the prompt) to move the model into its answer.
+    /// Calibrated empirically against the 10 project benchmark scenarios -- see
+    /// `docs/benchmarks/generation-pipeline-tuning.md`'s Loop 20 section for the full
+    /// budget-sweep table and the reasoning behind the chosen value. A registry field (not
+    /// a hardcoded constant) so a future loop can retune without touching generation logic.
+    pub think_budget: Option<usize>,
 }
 
 /// Static registry of known models. Only `qwen3-0.6b` is exercised (downloaded + run) this
@@ -61,6 +72,9 @@ pub const REGISTRY: &[ModelEntry] = &[
         filename: "Qwen3-0.6B-Q8_0.gguf",
         license: "apache-2.0",
         suppress_think: false,
+        // Loop 20: see the field doc comment above + generation-pipeline-tuning.md for the
+        // calibration sweep that produced this value.
+        think_budget: THINK_BUDGET_QWEN3_0_6B,
     },
     ModelEntry {
         id: "qwen3-4b",
@@ -78,6 +92,7 @@ pub const REGISTRY: &[ModelEntry] = &[
         filename: "Qwen3-4B-Q5_K_M.gguf",
         license: "apache-2.0",
         suppress_think: true,
+        think_budget: None,
     },
     ModelEntry {
         id: "minicpm5-2b",
@@ -96,6 +111,7 @@ pub const REGISTRY: &[ModelEntry] = &[
         filename: "MiniCPM5-2B-Q4_K_M.gguf",
         license: "apache-2.0",
         suppress_think: true,
+        think_budget: None,
     },
     ModelEntry {
         id: "laya",
@@ -113,8 +129,15 @@ pub const REGISTRY: &[ModelEntry] = &[
         filename: "laya_english_q8_0.gguf",
         license: "apache-2.0",
         suppress_think: false,
+        think_budget: None,
     },
 ];
+
+// Loop 20: the calibrated Qwen3-0.6B think-budget value, factored out to a single named
+// constant so the registry table above stays scannable and the chosen value + its provenance
+// are documented in exactly one place (see docs/benchmarks/generation-pipeline-tuning.md for
+// the full sweep this was picked from).
+const THINK_BUDGET_QWEN3_0_6B: Option<usize> = Some(150); // Loop 20 calibrated winner (10/10 valid, 6/9 correct, 2486ms mean -- see docs/benchmarks/generation-pipeline-tuning.md).
 
 /// Looks up a registry entry by its short CLI id.
 pub fn find(id: &str) -> Result<&'static ModelEntry, ModelsError> {

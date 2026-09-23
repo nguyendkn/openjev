@@ -245,7 +245,13 @@ pub(crate) fn run_bench(
     engine.reset_context();
 
     let t0 = Instant::now();
-    let generate = run_generate(engine, &req.prompt, &req.options, entry.suppress_think)?;
+    let generate = run_generate(
+        engine,
+        &req.prompt,
+        &req.options,
+        entry.suppress_think,
+        entry.think_budget,
+    )?;
     timings.generation_ms = t0.elapsed().as_millis();
 
     // Laya (3rd comparison method): calls the separately-running `laya serve` process (see

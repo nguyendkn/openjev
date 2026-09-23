@@ -198,3 +198,164 @@ distributions for context:
 4. Qwen3-4B's `2_jailbreak_detection` "flip" may not be a bug at all — both independent scoring
    methods agree and disagree with the documented expected label; worth revisiting whether the
    expected answer itself is right.
+
+---
+
+## Loop 20 — bounded/partial-CoT token-budget forcing for Qwen3-0.6B
+
+Real measurements taken directly on `103.146.166.46` (Xeon Gold 5320, no AMX-INT8), the actual
+production box, via `/tmp/loop20-target` (isolated `CARGO_TARGET_DIR`, never shared with any
+other loop's build).
+
+### 1. Objective and technique choice (Task 1)
+
+Loop 19 left Qwen3-0.6B on a binary policy: full `<think>` suppression (Loop 18: 10/10 valid
+JSON, 3/9 correct, 632ms) vs. natural unbounded CoT (Loop 19: 7/10 valid, 5/9 correct, 7,133ms,
+~11x slower). Loop 20's objective: try a bounded/partial-CoT token budget as a middle ground.
+
+**Technique chosen: token-budget forcing** (not NOWAIT-style logit-bias suppression). The real
+`llama-cpp-2 0.1.156` sampler source (`sampling.rs`) was checked directly: `LlamaSampler::
+logit_bias(n_vocab, biases)` genuinely exists and is a safe, pure additive-logit operation (not
+the fragile C++ grammar engine that SIGABRT'd in Loop 19's GBNF attempt) — so NOWAIT was
+technically viable this loop, unlike grammar-constraining. It was not implemented because:
+(a) Task 3's calibration requirement ("try 2-3 budget values, measure the tradeoff") is built
+around a hard token ceiling, which budget-forcing gives directly and NOWAIT does not (NOWAIT
+only gives a probabilistic 27-51% CoT reduction, no guaranteed ceiling); (b) NOWAIT requires
+correctly identifying Qwen3-tokenizer filler-token ids ("Wait", "Hmm", "Let me think again" —
+multi-token, context-dependent) — unvalidated extra research surface within this loop's budget;
+(c) trialling both techniques would double the sweep's compute load on the shared production
+box, against this project's own repeated documented CPU-overload lesson (Loops 13-15).
+**Flagged as a real follow-up** if a future loop wants to push further than budget-forcing's
+ceiling allows.
+
+### 2. Implementation (Task 2)
+
+- `crates/models/src/download.rs`: `ModelEntry` gains `think_budget: Option<usize>` (a registry
+  field, not a hardcoded constant, per the dev-doc's own suggestion — future tuning needs no
+  code change to `generate.rs`). `None` for `qwen3-4b`/`minicpm5-2b`/`laya` (their
+  `suppress_think: true` already closes `<think>` at the prompt, so the field is inert there
+  regardless of its value — set to `None` for clarity, not correctness). `qwen3-0.6b` carries
+  the calibrated value (see §3).
+- `crates/pipeline/src/generate.rs::run_generate`: gains a `think_budget: Option<usize>`
+  parameter and two new pieces of state, `think_opened`/`think_closed` (substring-tracked over
+  the growing generated text). When `think_budget` is `Some(n)` and the model has opened
+  `<think>` but not closed it after `n` generated tokens, the literal `</think>\n\n` (same text
+  Loop 18 used to suppress thinking entirely) is force-injected as real decoded/accepted
+  tokens via `tokenize_no_bos` + `decode_next_id` — not just appended to the output string —
+  then normal greedy sampling resumes for the answer. This never fires if `suppress_think` is
+  `true` (nothing open to force-close) or if the model never opened `<think>` at all (a model
+  that skips straight to prose is left alone). Added `GenerateResult::think_budget_forced: bool`
+  for sweep diagnostics. Plumbed through all 3 call sites (`apps/server/src/app.rs`,
+  `apps/cli/src/main.rs`, `apps/server/src/bin/topology_probe.rs`).
+- Sanity-checked with `think_budget=None`: reproduces Loop 19's exact behavior byte-for-byte
+  (same failure mode on `2_jailbreak_detection`, `think_budget_forced: false`) — confirms the
+  new code path is a safe no-op when unset.
+
+### 3. Budget-sweep calibration (Task 3)
+
+10 project scenarios, `openjev-cli --skip-laya`, one request per scenario, `nice -n 10`,
+1s gap between requests. Correctness scored against the documented expected-answer key
+(`docs/benchmarks/quant-sweep-loop16/harness-scen.json`, 9/10 scenarios have a documented
+expected answer; `8_adversarial_ambiguity` is intentionally unscored).
+
+A real bug was found and fixed in the calibration harness itself before trusting any numbers:
+an early jq filter silently dropped scenario 8's entire result record (an empty-string jq value
+made the whole object-construction pipeline emit zero outputs) — caught by `n` reading 9 instead
+of 10, fixed, and the `None` baseline was re-run from scratch for consistency with the other
+sweep points.
+
+| `think_budget` | valid JSON /10 | correct /9 | mean `generation_ms` | forced-close count |
+|---|---|---|---|---|
+| Loop 18 (reference, prior loop) | 10/10 | 3/9 | 632 | n/a |
+| Loop 19 (reference, prior loop) | 7/10 | 5/9 | 7,133 | n/a |
+| `None` (this loop, fresh repro on new binary) | 7/10 | 5/9 | 7,007.7 | 0/10 |
+| **`150`** | **10/10** | **6/9** | **2,486** | 10/10 (all forced) |
+| `300` | 10/10 | 6/9 | 4,143.9 | 5/10 |
+| `450` | 10/10 | 6/9 | 5,013.2 | 3/10 |
+
+The `None` re-run (7,007.7ms) closely reproduces Loop 19's own number (7,133ms) on a fresh
+build — cross-loop consistency check, confirms the new code path doesn't silently change
+behavior when unconfigured.
+
+**150 dominates 300 and 450**: identical valid-JSON (10/10) and correct-count (6/9), but
+noticeably faster (2,486ms vs 4,144ms/5,013ms) — the extra budget headroom in 300/450 bought
+zero additional correctness on this 10-scenario suite, only extra latency from the (rarer)
+naturally-closing scenarios running longer before landing on an answer. All three budget values
+tested comfortably beat Loop 19's natural-CoT baseline on every axis simultaneously.
+
+### 4. Validation against both reference points (Task 4)
+
+**`think_budget=150` vs Loop 19** (7/10 valid, 5/9 correct, 7,133ms): better on **all 3 axes**
+— more valid JSON (10 vs 7), more correct (6 vs 5), ~2.9x faster (2,486ms vs 7,133ms). Not a
+marginal win.
+
+**`think_budget=150` vs Loop 18** (10/10 valid, 3/9 correct, 632ms): ties on valid-JSON (10/10),
+doubles correctness (6/9 vs 3/9), costs ~3.9x more latency (2,486ms vs 632ms) — but both remain
+sub-3-second, and 150 is still ~2.9x *faster* than the only other config (natural CoT) that gets
+close to its correctness level. Not "drastically worse" on the third axis in absolute terms.
+
+**Success criterion met**: a real, measured configuration that beats both extremes on multiple
+axes without being drastically worse on the remaining one exists — `think_budget=150`. This is
+not a forced/cherry-picked result: it was the front-runner from the first sweep point onward
+and held its lead cleanly against both higher-budget alternatives.
+
+### 5. Deployment (Task 5)
+
+Deployed `think_budget=150` for `qwen3-0.6b` (`crates/models/src/download.rs`'s
+`THINK_BUDGET_QWEN3_0_6B` constant).
+
+- **Pre-deploy backup**: `/root/backups/loop20/openjev-server.pre-loop20.bin` (md5
+  `5ef391eab27b3f3c826f9df855996346`) — **exact match to Loop 19's own documented deployed
+  binary md5**, confirming production was genuinely untouched between Loop 19 and Loop 20, not
+  just claimed. `/root/backups/loop20/openjev-cli.pre-loop20.bin` (md5
+  `7fedf60636b00476cb04a114bd1a86f4`, also matches Loop 19's cli md5). Rollback: `cp
+  /root/backups/loop20/openjev-server.pre-loop20.bin /tmp/openjev/target/release/openjev-server
+  && systemctl restart openjev-server` (same for the CLI binary, no restart needed).
+- **Deployed** (atomic `mv`, same pattern as Loop 18/19 — the running binary can't be
+  overwritten in place): `openjev-server` md5 `9f4b8d0af949cc851b8cf6c131d3767d`, `openjev-cli`
+  md5 `c2b712a56985fb9f7c6882ba7f0b7e3a`. Both built from `/tmp/loop20-target`, deployed into
+  the live `/tmp/openjev/target/release/` path the systemd unit actually runs
+  (`ExecStart=/tmp/openjev/target/release/openjev-server --port 80 --workers 4 --threads 7`,
+  confirmed via `systemctl show`, unaffected by the binary swap).
+- **Verified**: `/health` → 200 post-restart; real external `/bench` call for `qwen3-0.6b`
+  returned valid JSON (`"answer":"ambiguous"`, `think_budget_forced: true`, 158 tokens
+  generated) confirming the deployed binary's new code path actually fires in production, not
+  just in the isolated build.
+
+### 6. Full regression (Task 6)
+
+- **`cargo build --workspace`** (debug + release) and **`cargo test --workspace`**: clean, 0
+  failures (8 real tests across `laya-native` and other crates pass), isolated
+  `/tmp/loop20-target`, run against the exact tree deployed.
+- **3 models × 3 methods** (readout/generate/laya): all pass via live `/bench`
+  (`scripts/bench-harness.sh loop20-post-deploy`, 30 requests, 0 errors). Qwen3-4B and
+  MiniCPM5-2B spot-checked unaffected — `qwen3-4b`'s `2_jailbreak_detection` still returns
+  `"ambiguous"`, byte-identical to Loop 18/19 (expected: their `suppress_think: true` path and
+  `think_budget: None` mean the new budget-forcing branch never fires for them).
+- **G13 fault injection**: drilled for real on an isolated scratch copy+binary
+  (`/tmp/g13-drill`/`/tmp/g13-drill-target`, port 8091, never the live artifact) — a
+  test-only panic trigger gated on a magic prompt string, built, exercised (clean HTTP 500,
+  `"engine worker 0 dropped the response"`), confirmed self-heal on the immediate next request
+  (fresh `model_load_ms: 876`, 200 OK, valid answer), then the entire scratch copy deleted.
+- **Laya-outage graceful degradation: LIVE-DRILLED** — `systemctl stop openjev-laya-serve`,
+  confirmed `/bench` still returns 200 with valid readout/generate and `"laya": null`, then
+  `systemctl start openjev-laya-serve` and confirmed full recovery (`laya` field back to real
+  scores) within 1 second.
+- **G17/G18 firewall**: external curl (from outside the server entirely) to
+  `103.146.166.46:8090` timed out as expected (`curl` exit code 28, connection timeout) — the
+  `lo`-only ACCEPT + interface-`*` DROP pair is unaffected by this loop's changes.
+
+### 7. Open gaps for a future loop
+
+1. NOWAIT-style logit-bias filler suppression was confirmed technically viable
+   (`LlamaSampler::logit_bias` exists, safe, distinct from the grammar-engine crash) but not
+   implemented or compared against budget-forcing — a real follow-up if `think_budget=150`'s
+   ~2,486ms mean is ever judged still too slow, since NOWAIT could in principle reduce CoT
+   length within the natural-closing path rather than hard-cutting it.
+2. The budget sweep only tested 150/300/450; the true optimum could lie below 150 (untested) —
+   150 was the lowest value tried and already dominated the higher ones, so a finer sweep
+   (e.g. 75, 100, 125) is a plausible cheap follow-up if further latency reduction is wanted,
+   though the marginal value looks small given 300/450 bought zero extra correctness over 150.
+3. Grammar-constrained decoding (Loop 19, closed avenue) and the two open security/compliance
+   flips (MiniCPM5-2B `9_compliance_gating`, Qwen3-4B `2_jailbreak_detection`) remain unchanged
+   open items from Loop 19 — out of this loop's scope per the dev-doc, not re-investigated.
