@@ -1,0 +1,162 @@
+{
+  "total_requests": 30,
+  "error_count": 0,
+  "per_model": [
+    {
+      "model": "minicpm5-2b",
+      "n": 10,
+      "wall_ms": {
+        "mean": 2939.6,
+        "median": 2857.5,
+        "max": 4455,
+        "n": 10
+      },
+      "model_load_ms": {
+        "mean": 232.2,
+        "median": 0,
+        "max": 2322,
+        "n": 10
+      },
+      "warmup_ms": {
+        "mean": 7.7,
+        "median": 0,
+        "max": 77,
+        "n": 10
+      },
+      "tokenize_ms": {
+        "mean": 0.3,
+        "median": 0,
+        "max": 1,
+        "n": 10
+      },
+      "constrained_readout_ms": {
+        "mean": 1283.4,
+        "median": 1263.5,
+        "max": 1926,
+        "n": 10
+      },
+      "generation_ms": {
+        "mean": 1354.2,
+        "median": 1302,
+        "max": 1660,
+        "n": 10
+      },
+      "laya_model_load_ms": {
+        "mean": 0,
+        "median": 0,
+        "max": 0,
+        "n": 10
+      },
+      "laya_inference_ms": {
+        "mean": 725.4,
+        "median": 567.5,
+        "max": 1568,
+        "n": 10
+      }
+    },
+    {
+      "model": "qwen3-0.6b",
+      "n": 10,
+      "wall_ms": {
+        "mean": 5162.2,
+        "median": 5006.5,
+        "max": 6233,
+        "n": 10
+      },
+      "model_load_ms": {
+        "mean": 0,
+        "median": 0,
+        "max": 0,
+        "n": 10
+      },
+      "warmup_ms": {
+        "mean": 0,
+        "median": 0,
+        "max": 0,
+        "n": 10
+      },
+      "tokenize_ms": {
+        "mean": 0.4,
+        "median": 0,
+        "max": 4,
+        "n": 10
+      },
+      "constrained_readout_ms": {
+        "mean": 905.4,
+        "median": 805.5,
+        "max": 1946,
+        "n": 10
+      },
+      "generation_ms": {
+        "mean": 4123.6,
+        "median": 4147.5,
+        "max": 4730,
+        "n": 10
+      },
+      "laya_model_load_ms": {
+        "mean": 0,
+        "median": 0,
+        "max": 0,
+        "n": 10
+      },
+      "laya_inference_ms": {
+        "mean": 694.8,
+        "median": 555,
+        "max": 1631,
+        "n": 10
+      }
+    },
+    {
+      "model": "qwen3-4b",
+      "n": 10,
+      "wall_ms": {
+        "mean": 7324.7,
+        "median": 7750.5,
+        "max": 8678,
+        "n": 10
+      },
+      "model_load_ms": {
+        "mean": 120.8,
+        "median": 0,
+        "max": 1208,
+        "n": 10
+      },
+      "warmup_ms": {
+        "mean": 16.7,
+        "median": 0,
+        "max": 167,
+        "n": 10
+      },
+      "tokenize_ms": {
+        "mean": 0,
+        "median": 0,
+        "max": 0,
+        "n": 10
+      },
+      "constrained_readout_ms": {
+        "mean": 2963.9,
+        "median": 3055.5,
+        "max": 3687,
+        "n": 10
+      },
+      "generation_ms": {
+        "mean": 4055.6,
+        "median": 4130,
+        "max": 4819,
+        "n": 10
+      },
+      "laya_model_load_ms": {
+        "mean": 0,
+        "median": 0,
+        "max": 0,
+        "n": 10
+      },
+      "laya_inference_ms": {
+        "mean": 554.5,
+        "median": 484.5,
+        "max": 1406,
+        "n": 10
+      }
+    }
+  ]
+}

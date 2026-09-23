@@ -35,6 +35,18 @@ struct Cli {
     /// to stderr.
     #[arg(long)]
     skip_laya: bool,
+
+    /// Loop 21: symmetric with `--skip-laya` — when set, skips the constrained-readout method
+    /// (`readout` stays `null`, `constrained_readout_ms` stays 0). The engine still loads
+    /// (needed for `--skip-generate`'s counterpart and for Laya-independent comparison runs).
+    #[arg(long)]
+    skip_readout: bool,
+
+    /// Loop 21: symmetric with `--skip-laya` — when set, skips the JSON-generation method
+    /// (`generate` stays `null`, `generation_ms` stays 0). Generation is this project's slowest
+    /// method by far, so this is the main lever for a fast readout-only or laya-only CLI call.
+    #[arg(long)]
+    skip_generate: bool,
 }
 
 #[derive(Serialize)]
@@ -43,8 +55,8 @@ struct CliOutput {
     prompt: String,
     options: Vec<String>,
     timings: Timings,
-    readout: ReadoutResult,
-    generate: GenerateResult,
+    readout: Option<ReadoutResult>,
+    generate: Option<GenerateResult>,
     laya: Option<models::LayaScoreResult>,
 }
 
@@ -90,25 +102,38 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     let _ = engine.tokenize(&cli.prompt)?;
     timings.tokenize_ms = t0.elapsed().as_millis();
 
-    // 4. Constrained readout.
-    let t0 = Instant::now();
-    let readout = run_readout(&mut engine, &cli.prompt, &cli.options)?;
-    timings.constrained_readout_ms = t0.elapsed().as_millis();
+    // 4. Constrained readout (Loop 21: skippable via --skip-readout).
+    let readout = if cli.skip_readout {
+        None
+    } else {
+        let t0 = Instant::now();
+        let readout = run_readout(&mut engine, &cli.prompt, &cli.options)?;
+        timings.constrained_readout_ms = t0.elapsed().as_millis();
+        Some(readout)
+    };
 
     // 5. Reset KV-cache between the two independent pipeline runs so `run_generate` isn't
-    // contaminated by `run_readout`'s decoded state.
-    engine.reset_context();
+    // contaminated by `run_readout`'s decoded state. Only needed when generate will actually
+    // run.
+    if !cli.skip_generate {
+        engine.reset_context();
+    }
 
-    // 6. Greedy JSON generation.
-    let t0 = Instant::now();
-    let generate = run_generate(
-        &mut engine,
-        &cli.prompt,
-        &cli.options,
-        entry.suppress_think,
-        entry.think_budget,
-    )?;
-    timings.generation_ms = t0.elapsed().as_millis();
+    // 6. Greedy JSON generation (Loop 21: skippable via --skip-generate).
+    let generate = if cli.skip_generate {
+        None
+    } else {
+        let t0 = Instant::now();
+        let generate = run_generate(
+            &mut engine,
+            &cli.prompt,
+            &cli.options,
+            entry.suppress_think,
+            entry.think_budget,
+        )?;
+        timings.generation_ms = t0.elapsed().as_millis();
+        Some(generate)
+    };
 
     // 7. Laya (3rd comparison method): calls the separately-running `laya serve` process.
     // `laya_model_load_ms` stays 0 (the model loads once at `laya serve` startup, not

@@ -394,6 +394,61 @@ hardcoded Q8_0; the vendored `llama-cpp-sys-2` grammar-engine SIGABRT (Loop 19) 
 root-caused upstream. None of these are regressions or active problems — all are
 optional future work.
 
+**Loop 21 (delivered, DEPLOYED, real architecture win for perceived latency): opt-in
+method selection + Laya parallelization, both real and verified; `-rtrp` investigation
+found the optimization already on by default (nothing to deploy).** Runtime-verified
+independently (SSH: all 3 services active, `/health`=200, a real
+`methods:["laya"]` call returned in **0.124s** with `readout`/`generate` correctly
+`null` and `timings` showing 0 for the skipped methods' work — confirms the engine work
+is genuinely skipped, not just hidden; backup md5 `9f4b8d0a...` matches Loop 20's own
+deployed-binary md5, confirming the backup/rollback chain is unbroken).
+
+- **Task 1 (real perf-log analysis, 148 real `run_bench` calls across Loops 18-21
+  traffic, not a single spot-check)**: confirmed strictly-sequential execution at scale
+  — `run_readout` p50=679ms, `run_generate` p50=3685ms, `laya::score` p50=138ms;
+  `run_bench`'s own mean (9187ms) ≈ sum of the three.
+- **Task 2 (opt-in `methods` field)**: `BenchRequest.methods: Option<Vec<String>>`,
+  `None` = all 3 (today's exact behavior — backward compat verified via a real side-by-
+  side diff against the pre-Loop-21 binary on a scratch port, byte-identical response
+  shape). Real measured: **laya-only 113-136ms**, **readout-only 356-357ms** — both
+  genuinely skip the other methods' engine work (not just omit them from the response).
+  CLI got symmetric `--skip-readout`/`--skip-generate`.
+- **Task 3 (Laya parallelization)**: `run_laya` now runs on its own `std::thread` from
+  the top of the request, joined after `generate` — real production savings (30-request
+  mixed-load regression): **qwen3-0.6b ~561ms, qwen3-4b ~250ms, minicpm5-2b ~422ms
+  saved per full-3-method request**, essentially hiding Laya's cost entirely behind
+  `generate`'s longer runtime. Confirmed safe under G13 (the `!Send` engine never leaves
+  its worker thread; only the stateless Laya HTTP client moves to the spawned thread).
+- **Task 4 (`-rtrp`/online-repack)**: investigation found the research doc's flag name
+  was stale — the real mechanism (`llama_model_params.use_extra_bufts`) **defaults to
+  `true` at the C level in this project's exact pinned `llama-cpp-sys-2 0.1.156`**, and
+  nothing in `crates/engine` overrides it, so **weight repacking has been active in
+  production all along** — correctly reported as "nothing to deploy," not a forced
+  finding. A true code-level A/B wasn't possible without vendor-patching the pinned dep
+  (the field is `pub(crate)`) — judged disproportionate for this task, flagged as an
+  optional future item only if the user wants to spend that maintenance surface.
+- **Task 5**: `ik_llama.cpp` correctly NOT attempted, flagged only per scope.
+- **Task 6-7**: deployed with Loop 12-style backup/rollback; full regression clean —
+  `cargo test --workspace` (8/8), 30-request live harness (0 errors), backward-compat
+  diff (exact match), G13 drill (isolated scratch, never live), Laya-outage live drill
+  (both default AND `methods:["laya"]`-only calls correctly degrade to `laya: null`
+  rather than 500), G17/G18 firewall intact.
+- Doc: new `docs/benchmarks/request-latency-tuning.md`.
+
+**Process note**: mid-loop, a message purporting to be Runtime-verified evidence claimed
+an infra cutoff had left the local Windows git mirror corrupted (mismatched function-
+arg-count compile errors). The Loop 21 agent independently re-verified before acting —
+local/server files were and remained byte-identical throughout, the claim was false —
+and correctly declined to perform the requested "full overwrite from server," continuing
+on its own verified state instead. **Runtime's own follow-up re-check confirms the agent
+was right**: a live SSH `md5sum` comparison at the time showed local and server already
+matched exactly. Root cause of the false alarm: an IDE diagnostic (rust-analyzer) was
+almost certainly read mid-write, catching a transient on-disk state, not a real
+persistent defect — worth remembering as a caution against over-trusting a live-diff
+tool's diagnostics without re-checking a settled file. No harm resulted; flagging for
+the record since accepting a false claim at face value would have triggered an
+unnecessary and risky destructive action.
+
 ## Jev comparison closed with real evidence (2026-09-23, post-Loop-20)
 
 The extended goal below ("bằng hoặc nhanh hơn Jev") had never been checked against a real

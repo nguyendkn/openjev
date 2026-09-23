@@ -38,17 +38,88 @@ pub struct BenchRequest {
     /// `--skip-laya` flag default.
     #[serde(default)]
     pub skip_laya: bool,
+    /// Loop 21 Task 2: opt-in subset of `"readout"`/`"generate"`/`"laya"` to actually run.
+    /// `None` (the field omitted entirely, the pre-Loop-21 shape) means "all three" — the
+    /// exact behavior of every request before this field existed, byte-identical response.
+    /// `Some(list)` skips the *engine/HTTP work itself* for any method not named, not just the
+    /// response field (see [`MethodSet::resolve`]/`run_bench`) — this is what makes a
+    /// `methods: ["laya"]` request return in ~100-200ms instead of paying the full sequential
+    /// readout+generate tax first.
+    #[serde(default)]
+    pub methods: Option<Vec<String>>,
+}
+
+/// Resolved from [`BenchRequest::methods`] (and `skip_laya`) once per request — which of the
+/// 3 comparison methods `run_bench` should actually execute.
+struct MethodSet {
+    readout: bool,
+    generate: bool,
+    laya: bool,
+}
+
+impl MethodSet {
+    /// `methods: None` -> all 3 (today's exact behavior, the backward-compat default).
+    /// `methods: Some([...])` -> only the named methods; unknown entries or an empty/
+    /// all-excluded set are rejected as `400 InvalidOptions` rather than silently running
+    /// nothing. `skip_laya: true` always wins over a `methods` list that names `"laya"` — one
+    /// authoritative "don't call laya" switch instead of two that could disagree.
+    fn resolve(methods: &Option<Vec<String>>, skip_laya: bool) -> Result<Self, ApiError> {
+        let mut set = match methods {
+            None => MethodSet {
+                readout: true,
+                generate: true,
+                laya: true,
+            },
+            Some(list) => {
+                let mut s = MethodSet {
+                    readout: false,
+                    generate: false,
+                    laya: false,
+                };
+                for m in list {
+                    match m.as_str() {
+                        "readout" => s.readout = true,
+                        "generate" => s.generate = true,
+                        "laya" => s.laya = true,
+                        other => {
+                            return Err(ApiError::InvalidOptions(format!(
+                                "unknown methods entry '{other}' — valid values: \
+                                 readout, generate, laya"
+                            )))
+                        }
+                    }
+                }
+                if !s.readout && !s.generate && !s.laya {
+                    return Err(ApiError::InvalidOptions(
+                        "methods, if provided, must name at least one of: readout, generate, \
+                         laya"
+                            .to_string(),
+                    ));
+                }
+                s
+            }
+        };
+        if skip_laya {
+            set.laya = false;
+        }
+        Ok(set)
+    }
 }
 
 /// Same field names/shape as `apps/cli`'s `CliOutput` JSON so both surfaces agree.
+///
+/// `readout`/`generate` became `Option` in Loop 21 (Task 2, method selection) — when a method
+/// is skipped its field serializes as JSON `null`, exactly like `laya` already did for
+/// `skip_laya`. When every method runs (the default, `methods` omitted), `Option::Some(x)`
+/// serializes identically to bare `x`, so the default response shape is unchanged.
 #[derive(Debug, Serialize)]
 pub struct BenchReport {
     pub model: String,
     pub prompt: String,
     pub options: Vec<String>,
     pub timings: Timings,
-    pub readout: ReadoutResult,
-    pub generate: GenerateResult,
+    pub readout: Option<ReadoutResult>,
+    pub generate: Option<GenerateResult>,
     pub laya: Option<models::LayaScoreResult>,
 }
 
@@ -170,10 +241,12 @@ async fn health() -> StatusCode {
     StatusCode::OK
 }
 
-/// Runs one full readout+generate benchmark pass for `req` against `engines` (one engine
-/// worker's local, thread-confined model cache), ensuring the model is loaded+cached first.
-/// Pure blocking work — only ever called on an engine-worker thread, never inline in an async
-/// handler (see `AppState`'s doc comment for why this replaces `spawn_blocking` here).
+/// Runs `req`'s requested subset of the 3 comparison methods (readout/generate/laya, all 3 by
+/// default — see [`MethodSet::resolve`]) against `engines` (one engine worker's local,
+/// thread-confined model cache), ensuring the model is loaded+cached first if the LLM engine is
+/// needed at all. Pure blocking work — only ever called on an engine-worker thread, never
+/// inline in an async handler (see `AppState`'s doc comment for why this replaces
+/// `spawn_blocking` here).
 pub(crate) fn run_bench(
     engines: &mut HashMap<String, Engine>,
     req: BenchRequest,
@@ -191,6 +264,7 @@ pub(crate) fn run_bench(
             "options must list at least one option, e.g. [\"A\",\"B\"]".to_string(),
         ));
     }
+    let methods = MethodSet::resolve(&req.methods, req.skip_laya)?;
 
     let mut timings = Timings::default();
 
@@ -199,72 +273,132 @@ pub(crate) fn run_bench(
     // before Loop 19 only the cache-miss branch needed `entry` at all.
     let entry = models::find(&req.model)?;
 
-    if !engines.contains_key(&req.model) {
-        let _s = timing::perf_span!("server::ensure_model_loaded");
-        let t0 = Instant::now();
-        let model_path = models::ensure_downloaded(entry)?;
-        let engine_config = EngineConfig {
-            n_threads,
-            n_batch,
-            ..EngineConfig::default()
-        };
-        let mut engine = Engine::load(&model_path, engine_config)?;
-        timings.model_load_ms = t0.elapsed().as_millis();
+    // Loop 21 Task 3: spawn Laya's HTTP round-trip on its own OS thread as early as possible
+    // (before any of the LLM engine work below), so it overlaps with readout+generate instead
+    // of paying its ~100-150ms strictly after them. Safe under G13's actor model: `Engine` is
+    // the only `!Send` state here and never leaves its home worker thread (nothing below
+    // touches `engine` from this spawned thread) — `run_laya` is a plain, stateless blocking
+    // HTTP client call (`models::laya::score`, confirmed synchronous, not already async) with
+    // no shared state, so handing it to an ad hoc `std::thread` is safe. Cloning `prompt`/
+    // `options` here (cheap, small strings/labels) is simpler and less risky than threading
+    // borrows across the spawn boundary.
+    // The closure times its own `run_laya` call and returns the elapsed duration alongside the
+    // result — NOT timed as spawn-to-join, since join can now happen well after the HTTP call
+    // itself finished (it overlaps the LLM work below) and a spawn-to-join wall-clock would
+    // wrongly inflate `laya_inference_ms` to include however long readout+generate took.
+    let laya_job = methods.laya.then(|| {
+        let prompt = req.prompt.clone();
+        let options = req.options.clone();
+        std::thread::spawn(move || {
+            let t0 = Instant::now();
+            let result = run_laya(&prompt, &options);
+            (t0.elapsed(), result)
+        })
+    });
 
-        // Warmup, same as apps/cli: one throwaway decode + reset so it isn't baked into
-        // constrained_readout_ms on this model's first-ever request.
-        let t0 = Instant::now();
-        let warmup_tokens = engine.tokenize("Hello")?;
-        engine.decode_prompt(&warmup_tokens)?;
+    let readout = if methods.readout || methods.generate {
+        if !engines.contains_key(&req.model) {
+            let _s = timing::perf_span!("server::ensure_model_loaded");
+            let t0 = Instant::now();
+            let model_path = models::ensure_downloaded(entry)?;
+            let engine_config = EngineConfig {
+                n_threads,
+                n_batch,
+                ..EngineConfig::default()
+            };
+            let mut engine = Engine::load(&model_path, engine_config)?;
+            timings.model_load_ms = t0.elapsed().as_millis();
+
+            // Warmup, same as apps/cli: one throwaway decode + reset so it isn't baked into
+            // constrained_readout_ms on this model's first-ever request.
+            let t0 = Instant::now();
+            let warmup_tokens = engine.tokenize("Hello")?;
+            engine.decode_prompt(&warmup_tokens)?;
+            engine.reset_context();
+            timings.warmup_ms = t0.elapsed().as_millis();
+
+            engines.insert(req.model.clone(), engine);
+        }
+
+        let engine = engines
+            .get_mut(&req.model)
+            .expect("just inserted or present");
+
+        // Unlike apps/cli (one process per run), this Engine is cached and reused across
+        // separate HTTP requests. Reset the KV cache before starting this request's work so a
+        // previous request's leftover generate-loop state (which is never reset after its own
+        // last decode) can't contaminate this request's readout — same isolation requirement
+        // as the readout/generate reset below, just applied at the request boundary too.
         engine.reset_context();
-        timings.warmup_ms = t0.elapsed().as_millis();
 
-        engines.insert(req.model.clone(), engine);
-    }
-
-    let engine = engines
-        .get_mut(&req.model)
-        .expect("just inserted or present");
-
-    // Unlike apps/cli (one process per run), this Engine is cached and reused across separate
-    // HTTP requests. Reset the KV cache before starting this request's work so a previous
-    // request's leftover generate-loop state (which is never reset after its own last decode)
-    // can't contaminate this request's readout — same isolation requirement as the
-    // readout/generate reset below, just applied at the request boundary too.
-    engine.reset_context();
-
-    let t0 = Instant::now();
-    let _ = engine.tokenize(&req.prompt)?;
-    timings.tokenize_ms = t0.elapsed().as_millis();
-
-    let t0 = Instant::now();
-    let readout = run_readout(engine, &req.prompt, &req.options)?;
-    timings.constrained_readout_ms = t0.elapsed().as_millis();
-
-    // MUST reset between the two independent pipeline runs, same as apps/cli.
-    engine.reset_context();
-
-    let t0 = Instant::now();
-    let generate = run_generate(
-        engine,
-        &req.prompt,
-        &req.options,
-        entry.suppress_think,
-        entry.think_budget,
-    )?;
-    timings.generation_ms = t0.elapsed().as_millis();
-
-    // Laya (3rd comparison method): calls the separately-running `laya serve` process (see
-    // `pipeline::laya::run_laya`). `laya_model_load_ms` stays 0 (model loads once at `laya
-    // serve` startup, not per-request). Unreachable/erroring Laya degrades gracefully — the
-    // readout/generate results above already succeeded, so a Laya failure must not 500 the
-    // whole request; `laya` stays `None` and the failure is only logged.
-    let laya = if req.skip_laya {
-        None
-    } else {
         let t0 = Instant::now();
-        let result = run_laya(&req.prompt, &req.options);
-        timings.laya_inference_ms = t0.elapsed().as_millis();
+        let _ = engine.tokenize(&req.prompt)?;
+        timings.tokenize_ms = t0.elapsed().as_millis();
+
+        let readout = if methods.readout {
+            let t0 = Instant::now();
+            let readout = run_readout(engine, &req.prompt, &req.options)?;
+            timings.constrained_readout_ms = t0.elapsed().as_millis();
+            Some(readout)
+        } else {
+            None
+        };
+
+        if methods.generate {
+            // MUST reset between the two independent pipeline runs, same as apps/cli.
+            engine.reset_context();
+        }
+
+        readout
+    } else {
+        // Loop 21 Task 2: a request that wants neither readout nor generate (e.g. a
+        // laya-only `methods: ["laya"]` call) never touches `Engine` at all — no model load,
+        // no warmup, no tokenize, no decode. This is the real time saved, not just a hidden
+        // field: without this branch a laya-only request would still pay the full LLM-engine
+        // tax before reaching the (already-running) Laya thread below.
+        None
+    };
+
+    let generate = if methods.generate {
+        let engine = engines
+            .get_mut(&req.model)
+            .expect("present: the readout||generate branch above just inserted/loaded it");
+        let t0 = Instant::now();
+        let generate = run_generate(
+            engine,
+            &req.prompt,
+            &req.options,
+            entry.suppress_think,
+            entry.think_budget,
+        )?;
+        timings.generation_ms = t0.elapsed().as_millis();
+        Some(generate)
+    } else {
+        None
+    };
+
+    // Laya (3rd comparison method): join the thread spawned at the top of this function (see
+    // above) instead of calling `run_laya` here — by this point its HTTP round-trip has
+    // already been running concurrently with the readout+generate work above, so joining is
+    // usually near-instant (the thread finished long ago and is just waiting to be reaped).
+    // `laya_inference_ms` is the duration the closure measured around its own `run_laya` call
+    // (NOT spawn-to-join wall-clock, which would wrongly include however long readout+generate
+    // took) — same real HTTP-round-trip number as before this loop, just no longer serialized
+    // onto the critical path. `laya_model_load_ms` stays 0 (model loads once at `laya serve`
+    // startup, not per-request). Unreachable/erroring Laya degrades gracefully — the
+    // readout/generate results above already succeeded (or were never requested), so a Laya
+    // failure must not 500 the whole request; `laya` stays `None` and the failure is only
+    // logged.
+    let laya = if let Some(handle) = laya_job {
+        let (elapsed, result) = handle.join().unwrap_or_else(|_| {
+            (
+                std::time::Duration::ZERO,
+                Err(pipeline::PipelineError::Laya(
+                    "laya worker thread panicked".to_string(),
+                )),
+            )
+        });
+        timings.laya_inference_ms = elapsed.as_millis();
         match result {
             Ok(laya) => Some(laya),
             Err(e) => {
@@ -272,6 +406,8 @@ pub(crate) fn run_bench(
                 None
             }
         }
+    } else {
+        None
     };
 
     Ok(BenchReport {
