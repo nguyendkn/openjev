@@ -219,6 +219,68 @@ K8s cleanup confirmed (`kubectl get pods,secrets -n llms-lab` → empty, quota b
 0/32). Results: `docs/benchmarks/quantization-sweep-results.md` +
 `docs/benchmarks/quant-sweep-loop16/` (raw data + reusable harness scripts).
 
+**Loop 18 (delivered, DEPLOYED to production, 1 real regression found): MAX_TOKENS
+think-suppression fix + Qwen3-4B quant-defect fix shipped; MiniCPM5-2B Q8_0 correctly
+rejected after real-hardware re-validation; Qwen3-0.6B accuracy regression surfaced,
+open.** Runtime-verified independently (SSH: registry file shows the deployed
+`Qwen3-4B-Q5_K_M.gguf` swap with an inline rationale comment; `systemctl is-active
+openjev-server` = active; `/health` = 200) before accepting this loop's self-report.
+
+- **Task 1 (MAX_TOKENS/think-suppression, shared code path `crates/pipeline::
+  run_generate`, affects ALL 3 LLMs)**: root cause was `apply_chat_template`'s
+  non-Jinja llama.cpp path never honoring the GGUF's `enable_thinking=False` branch.
+  Fix: append literal `<think>\n\n</think>\n\n` post-assistant-turn (reproduces the
+  real template's effect) + raise cap 512→768 as a safety net (mostly unused post-fix).
+  Proven via ablation that suppression (not the cap raise) is what worked — cap-alone
+  was WORSE than baseline. Real 10-scenario before/after: valid-JSON 6-7/10→10/10 for
+  all 3 models, generation_ms **7-12x faster** (e.g. Qwen3-4B: 31,023ms→4,379ms).
+  **Honest cost, NOT fully clean**: 2 previously-correct answers flipped wrong on the
+  larger models (Qwen3-4B `2_jailbreak_detection`, MiniCPM5-2B `9_compliance_gating`
+  — both in Loop 16's own flagged "security/compliance" risk class) — net correct-count
+  still improved for both. **Qwen3-0.6B is a real net regression: correct-answer count
+  5/9→3/9** despite JSON validity going 7/10→10/10 — the smallest model appears to lean
+  on its visible CoT for correctness more than the larger two. Shipped anyway (D_18
+  scoped deep validation to Qwen3-4B; invalid JSON is judged the worse failure mode for
+  downstream consumers) but this is an **open, unresolved regression on a
+  currently-shipping model** — flagged for a follow-up loop, not silently accepted.
+- **Task 2 (registry mismatch)**: fixed, zero behavior change (confirmed dead code path
+  — Laya never reads the registry, HTTP-only to `laya serve`).
+- **Task 3 (MiniCPM5-2B Q8_0)**: re-validated on real Ice Lake hardware, Loop 16's K8s
+  "6.6% faster" claim did NOT hold — real: -42% tok/s, -46% prompt-processing (AMX-INT8
+  advantage evaporates without AMX). Correctly **skipped** — PPL win alone (+5.28%→
+  +0.06%) doesn't justify a ~30-40% latency regression. Stays Q4_K_M.
+- **Task 4 (Qwen3-4B Q5_K_M)**: validated + **deployed**. Fixes a real quant-quality
+  defect (+15.24%→+0.01% PPL) independent of the AMX question. Real added cost ~670ms/
+  request generation_ms (post-Task-1-fix baseline is now only 6-10 output tokens, so
+  this is affordable), zero answer changes from the quant swap itself across 10
+  scenarios.
+- **Task 5 (deploy discipline)**: Loop 12-style backup+rollback — old binaries backed
+  up (`/root/backups/loop18/*.pre-loop18.bin`, md5-recorded), binary embeds registry as
+  a Rust const so one swap reverts pipeline fix + quant choice together, verified via
+  `/health` + real external curl.
+- **Task 6 (regression)**: 3×3 models×methods clean; G13 fault-injection drilled for
+  real on an isolated scratch binary (not the live artifact) — confirmed panic→500 in
+  1.26s→respawn→self-heal, then reverted, md5-confirmed final tree matches deployed
+  binary; G17/G18 firewall intact; reference case (`capital of France` via Laya)
+  exact-matches the historically documented value. **Laya-outage degrade NOT live-
+  drilled this loop** (session blocked stopping the live `laya serve` process as
+  prod-workload interference) — verified via code-path review (zero changes to that
+  branch) + today's own production logs showing it already fired correctly multiple
+  times; a live drill is still owed in a maintenance window. `cargo build`/`test
+  --workspace` clean.
+- **Task 7**: `docs/benchmarks/quantization-sweep-results.md` §11 addendum written
+  with real Ice Lake numbers vs Loop 16's K8s numbers + per-model deploy reasoning.
+
+**Open gaps carried to next loop**: (1) Qwen3-0.6B think-suppression regression
+(5/9→3/9 correct) — needs a per-model policy (e.g. skip suppression for the smallest
+model, or partial-think truncation instead of full suppression); (2) the 2
+security/compliance-class answer flips deserve closer scrutiny given Loop 16 already
+flagged this scenario class as sensitive; (3) Laya-outage live drill still owed;
+(4) Laya F16 swap still blocked on `crates/laya-native`'s hardcoded Q8_0 (untouched).
+Uncommitted at handback: `crates/pipeline/src/generate.rs`, `crates/models/src/
+download.rs`, new `apps/server/src/bin/quant_bench.rs`, updated
+`quantization-sweep-results.md` — Runtime to commit after recording this loop.
+
 ## Extended goal (2026-09-23): beat Jev's latency, not just match it
 
 New user directive after the original 6-item DoD was met: current performance still "too low"

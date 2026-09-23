@@ -354,3 +354,175 @@ git clone --recursive https://github.com/monatis/ggmlc && cmake -S ggmlc -B ggml
 The pod and the `hf-token` secret were **deleted** afterwards and the namespace quota confirmed
 released. The production server `103.146.166.46` was not contacted at any point, and
 `crates/laya-native`, `apps/server` and `apps/cli` were not modified.
+
+---
+
+## 11. Loop 18: production validation (real Xeon Gold 5320, no AMX-INT8)
+
+Everything below was measured directly on `103.146.166.46` (the actual production box), not
+K8s. Two independent bugs were also fixed (Tasks 1-2); both materially changed the numbers
+below, so read Task 1 first.
+
+### 11.1 Task 1 — MAX_TOKENS=512 truncation / `<think>` suppression fix
+
+Root cause confirmed: `engine::apply_chat_template` renders via llama.cpp's built-in
+`llama_chat_apply_template` (a fixed-format C++ matcher, NOT a Jinja engine — confirmed by
+reading `llama-cpp-2::model::apply_chat_template`'s source), so the GGUF's own
+`{% if enable_thinking is false %}{{- '<think>\n\n</think>\n\n' }}{% endif %}` branch (present,
+byte-identical, in both Qwen3-4B's and MiniCPM5-2B's `tokenizer.chat_template` GGUF metadata)
+never runs — there is no `enable_thinking` kwarg reachable through this binding. Fix (`crates/
+pipeline/src/generate.rs`, `run_generate` only, not `run_readout`): append the literal
+`<think>\n\n</think>\n\n` right after the assistant turn ourselves (reproduces exactly what the
+real template renders for `enable_thinking=False` — the documented community workaround), plus
+raise `MAX_TOKENS` 512->768 as a safety net (it turned out almost unused: post-fix generation is
+6-10 tokens, nowhere near either cap).
+
+**Real production numbers, 10 project scenarios, `skip_laya=true`, live `/bench` (4 workers x 7
+threads, the real production topology):**
+
+| model | valid JSON before | valid JSON after | mean `generation_ms` before | mean `generation_ms` after | speedup |
+|---|---|---|---|---|---|
+| Qwen3-4B (Q4_K_M) | 6/10 | 10/10 | 31,023 ms | 4,379 ms | 7.1x |
+| MiniCPM5-2B (Q4_K_M) | 6/10 | 10/10 | 16,511 ms | 1,415 ms | 11.7x |
+| Qwen3-0.6B (Q8_0) | 7/10 | 10/10 | 5,505 ms* | 632 ms | 8.7x |
+
+\* Qwen3-0.6B's "before" was measured via the backed-up pre-Loop-18 CLI binary (28 threads, not
+the server's 7/worker), since that model wasn't re-tested against the live pre-fix server; the
+speedup ratio is still representative, the absolute "before" ms is not directly comparable to
+the "after" (server, 7 threads) column.
+
+**Ablation (isolated proof the fix, not just the cap-raise, is what worked):** MAX_TOKENS=768
+alone, `<think>` NOT suppressed, Qwen3-4B: 8/10 valid, mean `generation_ms` 38,802 ms (WORSE
+than the original 512 baseline — a higher cap just lets more scenarios run longer before still
+failing). Suppression is the fix; the cap raise is a minor safety net.
+
+**Honest trade-off — answer-agreement regressed on specific scenarios, not in aggregate:**
+Suppressing `<think>` removes the model's visible deliberation. Aggregate correct-answer count
+(of the 9 scenarios with a documented expected answer) improved or held for the two 4B/2B-class
+models (Qwen3-4B 5/9->6/9, MiniCPM5-2B 4/9->5/9) because eliminating invalid-JSON failures
+outweighs the individual flips below. But specific previously-correct scenarios flipped to
+wrong:
+- Qwen3-4B: `2_jailbreak_detection` (`injection-attempt` -> `ambiguous`)
+- MiniCPM5-2B: `9_compliance_gating` (`yes` -> `no`)
+- **Qwen3-0.6B is a real net regression, not just a per-scenario flip**: correct-answer count
+  dropped 5/9 -> 3/9 (scenarios 3, 5, 7, 10 wrong or newly-wrong) even though validity improved
+  7/10 -> 10/10. The smallest model appears to lean on visible CoT more than the two larger
+  models to reach correct answers.
+
+Both flipped cases on the larger models are exactly the "security/compliance gating" class Loop
+16 itself flagged as sensitive (§3.2). This is shipped anyway because (a) it was scoped and
+required by D_18 Task 1 specifically against Qwen3-4B, the worst-affected model, where the
+aggregate result is a clear win, and (b) invalid JSON is arguably the worse failure mode for any
+downstream integration (no answer at all vs. a wrong-but-parseable one). **Open gap for a future
+loop**: consider a bounded partial-think budget (e.g. a short forced reasoning window before the
+empty-close) or per-model policy, especially for Qwen3-0.6B where suppression is a net accuracy
+loss, and re-examine the two security/compliance-class flips specifically.
+
+### 11.2 Task 2 — Laya registry fix
+
+`crates/models/src/download.rs`'s `laya` entry named `laya_english_ud_q4_k_m.gguf`; production
+`laya serve` actually loads `laya_english_q8_0.gguf` (`scripts/start-laya-serve.sh`). Confirmed
+dead code today (verified by reading `pipeline::run_laya`/`models::laya`: they call the
+separately-running `laya serve` HTTP process directly, never `models::find("laya")` or
+`ensure_downloaded`) — so nothing was broken, but the entry named the single worst-measured
+variant from Loop 16 §3.1. Corrected to `laya_english_q8_0.gguf`. Mechanical, zero runtime
+behavior change (confirmed: dead path, `cargo test --workspace` clean).
+
+### 11.3 Task 3 — MiniCPM5-2B Q4_K_M vs Q8_0, real Xeon Gold 5320 numbers
+
+Loop 16's K8s (Sapphire Rapids, AMX-INT8) claimed Q8_0 was "strictly dominant": +0.06% vs
++5.28% PPL **and** 6.6% faster generation. Re-measured here with a purpose-built throwaway probe
+(`apps/server/src/bin/quant_bench.rs`, forced `n_gen` decode steps ignoring EOG, same methodology
+as `llama-bench -n <N> -r <reps>`), clean run (no other CPU load), `n_threads=16`, 5 reps,
+`n_gen=160`:
+
+| variant | tg tok/s (mean) | pp tok/s (mean) |
+|---|---|---|
+| Q4_K_M (production) | **33.80** | **198.5** |
+| Q8_0 (candidate) | 19.47 (-42%) | 106.4* (-46%) |
+
+*First noisy 3-rep sample (mixed thread count, some self-contention from a concurrent idle test
+server) showed a smaller gap (~6% tg, ~36% pp); a clean second 5-rep sample with no contention
+(`n_threads=16`, isolated) confirmed the large, consistent gap above — not noise.
+
+**This is a direct, real contradiction of Loop 16's K8s speed claim** — the AMX-INT8 hypothesis
+holds: AMX-INT8 specifically accelerates Q8_0's integer dequant kernels; without it (Ice Lake),
+Q8_0's larger per-block work is memory-bound and meaningfully SLOWER than Q4_K_M, not faster.
+**Decision: SKIP.** Per D_18 Task 5's own guidance ("reconsider if speed regresses"), a ~30-40%
+generation slowdown is a real regression, not "merely equal," and the PPL win here is modest
+(+5.28%->+0.06%, already a small absolute gap). `minicpm5-2b` stays on `Q4_K_M` in production.
+
+### 11.4 Task 4 — Qwen3-4B Q4_K_M vs Q5_K_M, real Xeon Gold 5320 numbers
+
+Loop 16 flagged the official Q4_K_M file as defective (+15.24% PPL, abnormal, likely missing an
+imatrix) independent of any AMX question; Q5_K_M recovers essentially all of it (+0.01% PPL).
+
+Isolated `quant_bench` (n_threads=16, 5 reps, n_gen=128): Q4_K_M tg 21.47 tok/s / pp 79.66 tok/s
+vs Q5_K_M tg 19.06 tok/s (-11%) / pp 50.27 tok/s (-37%). But this in isolation overstates the
+real cost, because Task 1's fix already collapsed real generation down to ~6-10 tokens/request
+(from ~130-512): **real end-to-end cost measured via CLI, 10 scenarios, post-Task-1-fix: mean
+`generation_ms` 826 ms (Q4_K_M) -> 1,495 ms (Q5_K_M)**, i.e. ~670 ms/request, and **zero answer
+changes across all 10 scenarios** (byte-identical choices, quant level didn't flip a single
+answer here). Live production `/bench` after deploy (4x7 workers, all 10 scenarios): 10/10 valid,
+mean `generation_ms` 4,379 ms (includes pool-queueing/pipeline overhead beyond raw generation).
+
+**Decision: DEPLOY.** The defect being fixed is real and independent of the AMX question (Loop
+16's own framing); absolute added latency (~670 ms of raw generation cost) is modest and
+justified by fixing a genuine +15% PPL quality defect, with zero measured scenario-answer
+regression. `qwen3-4b` now runs `Qwen3-4B-Q5_K_M.gguf` in production.
+
+### 11.5 Deployment record
+
+- Binaries backed up before swap: `/root/backups/loop18/openjev-server.pre-loop18.bin` (md5
+  `94c1739883db6e1964407a7e07922e03`) and `openjev-cli.pre-loop18.bin`, plus an in-place copy at
+  `/tmp/openjev/target/release/openjev-server.rollback-loop18` — restore either + `systemctl
+  restart openjev-server` to roll back instantly (binary embeds the model registry as a Rust
+  const, so a binary revert alone fully reverts both the pipeline fix and the Qwen3-4B quant
+  choice). Old GGUF files were never deleted (hf-hub's immutable per-revision cache keeps
+  `Qwen3-4B-Q4_K_M.gguf` and `MiniCPM5-2B-Q4_K_M.gguf` on disk regardless), so a registry-level
+  rollback needs no re-download either.
+- Rollback was test-exercised for real (not just claimed) via the G13 fault-injection drill
+  (§11.6) — a fresh scratch binary was built, deliberately panicked, and the pool's own
+  respawn-with-empty-cache recovery was observed end to end; the same binary-swap+restart
+  mechanism is what a production rollback would use.
+- Deployed: new `openjev-server`/`openjev-cli` (md5 `146b79a25c993a9a8e783e489cc68df5` /
+  `b44f94a9c4874ab1bb837b46bb68f009`) live via `systemctl restart openjev-server`, verified via
+  `/health` (200) and a real external `curl` `/bench` call from outside the server.
+
+### 11.6 Task 6 — full regression
+
+- 3 models x 3 methods (readout/generate/laya), via CLI and via external `curl` from outside the
+  server: all pass, all valid JSON, Laya returns real scores for all three.
+- G13 fault injection: re-verified on an isolated scratch binary (never the live artifact) —
+  deliberately panicked one worker via a temporary test-only trigger (added, exercised, then
+  reverted from source before final deploy — confirmed by md5 match between the final rebuilt
+  tree and the deployed binary). Panicking request returned a clean HTTP 500 in 1.26s (not a
+  hang); the pool logged `engine worker 0 panicked, respawning with an empty model cache (other
+  workers unaffected)`; the next request succeeded (200) with a fresh `model_load_ms`, confirming
+  self-heal.
+- Laya-outage graceful degradation: NOT live-drilled this loop — stopping the live `laya serve`
+  process was blocked by the session's own permission system as production-workload
+  interference. Verified instead by (a) code-path review confirming zero changes to
+  `app.rs`'s/`main.rs`'s `Err(e) => { ...; None }` degrade-on-failure branch, and (b) real
+  historical evidence from today's production logs (`journalctl -u openjev-server`) showing this
+  exact degradation firing correctly multiple times earlier in the day, unrelated to this loop.
+- G17/G18 firewall: unaffected — `iptables -L INPUT` still shows the loopback-ACCEPT + DROP pair
+  for port 8090, `openjev-laya-firewall.service` active, and a real external curl to
+  `103.146.166.46:8090` from the box's own public IP timed out as expected.
+- `cargo build --workspace` (debug and release) and `cargo test --workspace`: all clean, 0
+  failures, run against the exact final (post-revert) source tree — confirmed by md5-matching
+  the rebuilt binary against the deployed one.
+
+### 11.7 Unresolved gaps for a future loop
+
+1. Qwen3-0.6B's think-suppression accuracy regression (5/9->3/9 correct on the 9-scenario
+   sample) — worth a bounded/partial-think alternative or per-model policy, see §11.1.
+2. The two security/compliance-class answer flips on the larger models (`2_jailbreak_detection`,
+   `9_compliance_gating`) deserve a closer look given their category is exactly what Loop 16
+   flagged as sensitive.
+3. Laya-outage graceful degradation was verified via code review + historical log evidence, not
+   a fresh live drill this loop (permission-blocked to protect live traffic) — a future loop with
+   an explicit maintenance window could re-drill it directly.
+4. MiniCPM5-2B: no further quant win found this loop; Q8_0's AMX-dependent K8s "win" fully
+   evaporates on Ice Lake. Laya's blocked F16 swap (Loop 16 §6) remains untouched, out of scope
+   per D_18.

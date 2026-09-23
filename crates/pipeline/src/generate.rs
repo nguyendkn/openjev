@@ -4,7 +4,16 @@ use engine::Engine;
 use serde::Serialize;
 use serde_json::Value;
 
-pub const MAX_TOKENS: usize = 512;
+// Loop 18: was 512. Loop 16 measured this hard-capping Qwen3's `<think>` reasoning mid-block
+// on ~40-50% of the 10 project scenarios for Qwen3-4B, which is what actually broke JSON
+// validity (not quantization). The primary fix is suppressing `<think>` altogether (see the
+// `<think>\n\n</think>\n\n` seed below in `run_generate`); this cap is now a safety net for
+// whatever short reasoning still slips through post-suppression, not the primary defense, so
+// it is raised modestly rather than to Loop 16's suggested 2048 (production Ice Lake measured
+// ~11-12 tok/s generation for Qwen3-4B, far below the K8s AMX pod's 30+ tok/s -- pushing the
+// cap that high would cost 60-90s+ of extra worst-case latency per request for little added
+// benefit once thinking is suppressed).
+pub const MAX_TOKENS: usize = 768;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct GenerateResult {
@@ -93,6 +102,20 @@ pub fn run_generate(
     let chat_prompt = engine
         .apply_chat_template(&full_prompt)
         .map_err(|e| PipelineError::Engine(e.to_string()))?;
+    // Loop 18 MAX_TOKENS-truncation fix. `engine::apply_chat_template` renders via
+    // llama.cpp's built-in `llama_chat_apply_template` (a fixed-format C++ matcher over the
+    // messages, confirmed by reading `llama-cpp-2::model::apply_chat_template`'s source), NOT
+    // a real Jinja engine -- so the GGUF's embedded chat template's `{% if enable_thinking is
+    // false %}{{- '<think>\n\n</think>\n\n' }}{% endif %}` branch (confirmed present, byte for
+    // byte identical, in both Qwen3-4B's and MiniCPM5-2B's `tokenizer.chat_template` GGUF
+    // metadata) never executes here; there is no `enable_thinking` kwarg to pass through this
+    // binding. Appending that exact literal text ourselves right after the assistant turn
+    // reproduces what the real template would render for `enable_thinking=False` -- this is
+    // the documented community workaround for chat-template engines that can't run arbitrary
+    // Jinja. It is inert prompt-conditioning text (never generated, so it costs zero tokens)
+    // that tells the model its reasoning block is already closed/empty, which in practice
+    // suppresses `<think>...</think>` generation entirely instead of just capping it.
+    let chat_prompt = format!("{chat_prompt}<think>\n\n</think>\n\n");
 
     let tokens = engine
         .tokenize(&chat_prompt)
