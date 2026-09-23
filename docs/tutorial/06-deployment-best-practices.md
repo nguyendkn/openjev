@@ -60,6 +60,74 @@ Deltas all within single-run noise (±5%). **Verdict**: Don't tune `n_batch` unl
 
 ---
 
+### Finding 4: An Empty `CMAKE_BUILD_TYPE` Cost 13x (Loop 11–12) — The Biggest Single Win
+
+The most expensive bug in this whole deployment was one unset CMake variable.
+
+`laya serve` is built from an external C++ project (`ggmlc`). It was configured in Loop 5 with a
+plain `cmake -S . -B build` — **no `-DCMAKE_BUILD_TYPE`**. CMake's default for that variable is
+the empty string, and an empty build type means CMake appends **no optimization flags at all**
+(neither `CMAKE_CXX_FLAGS_RELEASE` nor `_DEBUG` applies). The result is an effectively `-O0`
+binary that looks completely normal: it builds without warnings, runs correctly, and produces
+the right answers. It just runs 13x slower.
+
+What made it invisible for six loops was that the *other* flag people did check looked right:
+
+```
+# Old production build — CMakeCache.txt
+CMAKE_BUILD_TYPE:STRING=          # <- empty. Nobody looked at this.
+GGML_NATIVE:BOOL=ON               # <- everyone checked THIS, and it was fine.
+```
+
+Loop 8 verified `GGML_NATIVE=ON` and `-march=native` on the real compiler command line, concluded
+"build flags are ruled out," and spent the next three loops hunting the remaining gap in ggmlc's
+algorithmic efficiency — eventually writing a whole native Rust reimplementation to escape it.
+The actual compiler invocations tell the story instantly, if you look at the *whole* line and not
+just the flag you came for:
+
+```
+# OLD (production, Loops 5-11)
+CXX_FLAGS = -std=gnu++17 -fPIC -march=native
+# NEW (Loop 12, -DCMAKE_BUILD_TYPE=Release)
+CXX_FLAGS = -O3 -DNDEBUG -std=gnu++17 -fPIC -march=native
+```
+
+`-march=native` without `-O3` tells the compiler *which* instructions it may use while telling it
+not to bother optimizing — the CPU-feature flag was doing almost nothing on its own.
+
+Measured effect on production, external `curl` (nothing else changed — same source commit, same
+Q8_0 model, same `--threads 28`, same systemd unit):
+
+| | `laya_inference_ms` |
+|---|---|
+| Before (`CMAKE_BUILD_TYPE=""`) | 1202 / 1267 / 1910 ms |
+| After (`CMAKE_BUILD_TYPE=Release`) | 113 / 113 / 129 / 131 / 158 ms |
+
+**Lessons**:
+
+1. **For any CMake project you build yourself, pass `-DCMAKE_BUILD_TYPE` explicitly.** There is no
+   safe default. Unlike Cargo (`--release`), Meson (`buildtype=debugoptimized`), or Go, CMake's
+   default is "no opinion", which in practice means unoptimized.
+2. **Verify at the compiler-invocation level, not the cache-variable level.** Read the real
+   `CXX_FLAGS` line, e.g. `grep CXX_FLAGS build/CMakeFiles/<target>.dir/flags.make` or
+   `cmake --build . -- VERBOSE=1`. A cache variable being set is not proof the flag you care
+   about reached `g++`, and — as here — checking one flag can create false confidence about all
+   the others.
+3. **Benchmark against a correctly-configured baseline before attributing a win to your own
+   design.** Loops 9–11 measured a hand-written Rust engine at ~95ms against a ~1262ms C++
+   incumbent and read that as a 13x architectural win. Rebuilt properly, the same C++ source hits
+   ~92.7ms — the Rust engine is at *parity*, and essentially the entire "win" was the missing
+   `-O3`. The rewrite is still worth continuing (see `crates/laya-native`), but on an honest
+   baseline. **A performance comparison is only as trustworthy as the weakest-configured side of
+   it**, and the side you didn't build yourself is the one to suspect.
+4. **A 10x+ unexplained gap is a configuration smell, not an algorithmic finding.** When a
+   32-core Xeon loses to a 4-core i3 by 11x (Loop 8's unresolved anomaly), the prior should be
+   "something in my setup is wrong," not "the upstream implementation is inefficient." Loop 8
+   wrote the gap down as an honest open question — which was the right call at the time — but the
+   size of the anomaly was itself the strongest available clue, and it pointed at the build.
+
+---
+
 ## Watch Out For: Default Flags in External Binaries
 
 ### Lesson: Laya's Default --threads Was 4 (Loop 8)
@@ -277,18 +345,46 @@ systemctl status openjev-laya-serve.service
 iptables -L INPUT -n
 # (applied via systemd unit openjev-laya-firewall.service, persisted across reboot)
 
-# Build flags (verified in CMakeCache.txt)
+# Rust-side build flags (verified in CMakeCache.txt of llama-cpp-sys-2's vendored build)
 GGML_NATIVE=ON  # -march=native
 GGML_OPENMP=ON  # threading backend
 GGML_AVX512=ON  # on this hardware
 GGML_BLAS=OFF   # CPU only
+
+# C++-side (ggmlc / laya serve) — Loop 12 fix, the one that mattered most
+cmake -S /tmp/ggmlc -B /tmp/ggmlc/build-release \
+  -DCMAKE_BUILD_TYPE=Release \   # <-- NOT optional; empty default = -O0 = 13x slower
+  -DGGML_NATIVE=ON
+cmake --build /tmp/ggmlc/build-release --target laya -j 24
+# verify the flags actually reached the compiler, don't trust the cache variable:
+grep CXX_FLAGS /tmp/ggmlc/build-release/CMakeFiles/ggml_lib.dir/flags.make
+# -> -O3 -DNDEBUG -std=gnu++17 -fPIC -march=native
 ```
 
-**Performance (from Loop 8 harness, 30 requests):**
+**Binary swap procedure** (back up first; a 2-second restart, fully reversible):
+
+```bash
+# deploy
+systemctl stop openjev-laya-serve.service
+cp -a /tmp/ggmlc/build/examples/laya/laya /root/laya-binary-backups/laya-<tag>.bak   # BACKUP
+cp -a <new-binary> <prod-path>.new && mv -f <prod-path>.new <prod-path>              # atomic rename
+systemctl start openjev-laya-serve.service
+curl -sf http://127.0.0.1:8090/health   # gate on this before declaring success
+
+# rollback = the same steps with the .bak as the source
+```
+
+Keep both directions as *scripts* (`deploy-o3.sh` / `rollback.sh`), and **actually run the
+rollback once** before you need it. Loop 12 did: rolled production back to the old binary,
+confirmed the old md5 and the old (pre-`-O3`) probability vector came back, then re-deployed. An
+untested rollback is a hope, not a plan.
+
+**Performance (Loop 12 harness, 30 requests, external `curl` verified):**
 - Constrained-readout: 112–291 ms (models 0.6B–4B)
 - Generation: 4.3–15.6s (models 0.6B–4B)
-- Laya: 1.2–1.4s (constant across models)
-- Uptime: 8+ days, zero unplanned restarts (only intentional fault injection + systemd control tests)
+- Laya: **~90–160 ms** (constant across models; was 1.2–1.4s before the `CMAKE_BUILD_TYPE` fix)
+- Uptime: 8+ days, zero unplanned restarts (only intentional fault injection, systemd control
+  tests, and Loop 12's ~2s binary-swap + rollback-drill windows)
 
 ---
 

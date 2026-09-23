@@ -89,6 +89,8 @@ pub fn find(id: &str) -> Result<&'static ModelEntry, ModelsError> {
 /// etag/sha256 accessor on this call path (it's used internally for cache validation but not
 /// returned to the caller) — documented gap, not blocking per D_2 Task 4.
 pub fn ensure_downloaded(entry: &ModelEntry) -> Result<PathBuf, ModelsError> {
+    let mut _s = timing::perf_span!("models::ensure_downloaded");
+    _s.set("model_id", entry.id.to_string());
     let client = HFClientSync::new().map_err(|e| ModelsError::ClientInit(e.to_string()))?;
     let (owner, name) = entry
         .hf_repo_id

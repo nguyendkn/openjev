@@ -19,6 +19,7 @@ pub struct ReadoutResult {
 /// softmax, not full-vocab softmax then filter"): the softmax normalization only ever sees the
 /// restricted set, so probabilities sum to 1 over the candidates alone.
 pub fn constrained_softmax(logits: &[f32], restricted_indices: &[usize]) -> Vec<f32> {
+    let _s = timing::perf_span!("pipeline::constrained_softmax");
     if restricted_indices.is_empty() {
         return Vec::new();
     }
@@ -48,6 +49,8 @@ pub fn run_readout(
     prompt: &str,
     options: &[String],
 ) -> Result<ReadoutResult, PipelineError> {
+    let mut _s = timing::perf_span!("pipeline::run_readout");
+    _s.set("n_options", options.len().to_string());
     if options.is_empty() {
         return Err(PipelineError::InvalidOptions(
             "no options given".to_string(),

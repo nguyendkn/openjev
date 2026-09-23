@@ -25,6 +25,7 @@ pub struct GenerateResult {
 /// - `<think>` with no matching `</think>` (truncated generation): drops everything from
 ///   `<think>` onward, since it's unterminated reasoning, not a final answer.
 pub fn strip_think(text: &str) -> String {
+    let _s = timing::perf_span!("pipeline::strip_think");
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     loop {
@@ -56,6 +57,7 @@ pub fn strip_think(text: &str) -> String {
 /// with an `"answer"` string field whose (trimmed) value matches one of `options`. Never
 /// panics on adversarial input — any parse/shape mismatch yields `None`.
 pub fn parse_and_validate(text: &str, options: &[String]) -> Option<Value> {
+    let _s = timing::perf_span!("pipeline::parse_and_validate");
     let start = text.find('{')?;
     let end = text.rfind('}')?;
     if end < start {
@@ -81,6 +83,8 @@ pub fn run_generate(
     prompt: &str,
     options: &[String],
 ) -> Result<GenerateResult, PipelineError> {
+    let mut _s = timing::perf_span!("pipeline::run_generate");
+    _s.set("n_options", options.len().to_string());
     let options_list = options.join(", ");
     let full_prompt = format!(
         "{prompt}\nOptions: {options_list}\nRespond with ONLY a JSON object of the exact form \

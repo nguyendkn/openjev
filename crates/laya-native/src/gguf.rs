@@ -19,6 +19,37 @@ pub struct Weights {
     pub head_max_len: usize,
     pub max_opts: usize,
     pub temperature_by_options: String,
+    /// `laya.temperature`, indexed by `QType` (choice, score, noul). Used when a question's
+    /// `(qtype, size)` bucket is missing from `temperature_by_options`.
+    pub temperature_by_qtype: [f32; 3],
+}
+
+/// Parses `laya.temperature`, which `laya`'s `fill_temperature` accepts as either a 3-element
+/// JSON array or a single number broadcast to all three question types.
+fn parse_temperatures(json: &str) -> [f32; 3] {
+    const DEFAULT: [f32; 3] = [1.6369, 1.25143, 1.9834]; // laya's own hardcoded fallback
+    let nums: Vec<f32> = json
+        .trim_matches(|c: char| c == '[' || c == ']' || c.is_whitespace())
+        .split(',')
+        .filter_map(|v| v.trim().parse::<f32>().ok())
+        .collect();
+    match nums.len() {
+        0 => DEFAULT,
+        1 => [nums[0]; 3],
+        _ => [nums[0], nums[1], *nums.get(2).unwrap_or(&nums[1])],
+    }
+}
+
+/// G22: `gguf_init_from_file` hands back two separately-owned allocations — the gguf context and
+/// (because `no_alloc == false`) a ggml context holding every tensor's data. `gguf_free` only
+/// releases the first, so both are freed here.
+impl Drop for Weights {
+    fn drop(&mut self) {
+        unsafe {
+            s::gguf_free(self.gguf);
+            s::ggml_free(self.ctx);
+        }
+    }
 }
 
 unsafe fn key_id(g: *mut s::gguf_context, k: &str) -> Option<i64> {
@@ -80,6 +111,7 @@ impl Weights {
                 head_max_len: kv_i32(g, "laya.head_max_len").unwrap_or(192) as usize,
                 max_opts: kv_i32(g, "laya.max_opts").unwrap_or(16) as usize,
                 temperature_by_options: kv_str(g, "laya.temperature_by_options").unwrap_or_default(),
+                temperature_by_qtype: parse_temperatures(&kv_str(g, "laya.temperature").unwrap_or_default()),
             })
         }
     }
@@ -117,10 +149,23 @@ impl Weights {
         }
     }
 
-    /// Temperature for a `(qtype, n_options)` bucket, clamped exactly as `common.py` does.
+    /// Temperature for a `(qtype, n_options)` bucket, matching `laya`'s `decode_answer` +
+    /// `temp_bucket` + `softmax_temp` exactly: look the bucket up in `laya.temperature_by_options`,
+    /// fall back to the per-qtype `laya.temperature` entry (NOT 1.0) when the bucket is absent,
+    /// and apply only `max(t, 1e-3)` — no 0.5 floor.
+    ///
+    /// The old `clamp(0.5, 5.0)` was wrong in a way real questions hit: the shipped
+    /// `choice:11+` bucket is 0.100583, so every question with >10 options was scored at T=0.5
+    /// and came out far flatter than `laya serve` (measured: 0.26 absolute probability error on
+    /// a 12-option question).
     pub fn temperature(&self, qtype_name: &str, k: usize) -> f32 {
         let size = if k <= 2 { "2" } else if k <= 5 { "3-5" } else if k <= 10 { "6-10" } else { "11+" };
         let needle = format!("\"{qtype_name}:{size}\":");
+        let default = match qtype_name {
+            "score" => self.temperature_by_qtype[1],
+            "noul" => self.temperature_by_qtype[2],
+            _ => self.temperature_by_qtype[0],
+        };
         let t = self
             .temperature_by_options
             .find(&needle)
@@ -129,7 +174,7 @@ impl Weights {
                 let end = rest.find(|c| c == ',' || c == '}')?;
                 rest[..end].trim().parse::<f32>().ok()
             })
-            .unwrap_or(1.0);
-        t.clamp(0.5, 5.0)
+            .unwrap_or(default);
+        t.max(1e-3)
     }
 }

@@ -5,3 +5,8 @@ edition = "2021"
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+# Already resolved transitively (via hf-hub/reqwest, see Cargo.lock) elsewhere in the workspace;
+# promoted to a direct dependency here for the perf-logger's 1-minute wall-clock file rotation
+# (`logger.rs`) so no new crate is actually added to the dependency tree.
+chrono = { version = "0.4", default-features = false, features = ["clock"] }

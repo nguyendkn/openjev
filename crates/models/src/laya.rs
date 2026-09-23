@@ -91,6 +91,8 @@ struct AnswerEntry {
 /// can include one-time graph-allocation overhead (`ggml_gallocr_needs_realloc`, observed on the
 /// real server); steady-state warm calls are much faster.
 pub fn score(prompt: &str, options: &[String]) -> Result<LayaScoreResult, LayaError> {
+    let mut _s = timing::perf_span!("models::laya::score");
+    _s.set("n_options", options.len().to_string());
     let mut criteria = serde_json::Map::new();
     for opt in options {
         criteria.insert(opt.clone(), serde_json::Value::Null);

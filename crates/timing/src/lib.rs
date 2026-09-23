@@ -1,3 +1,7 @@
+pub mod logger;
+
+pub use logger::PerfSpan;
+
 use serde::Serialize;
 
 #[derive(Serialize, Clone, Copy, Debug)]

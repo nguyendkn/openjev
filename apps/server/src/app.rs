@@ -63,13 +63,13 @@ pub struct AppState {
 }
 
 impl AppState {
-    /// `n_threads` is threaded through to every `EngineConfig` this server's dedicated engine
-    /// worker loads (Loop 6: was previously hardcoded to `EngineConfig::default()`, making
-    /// `n_threads` tuning require a recompile; now a real startup-time value, see
-    /// `main.rs`'s `--threads` flag).
-    pub fn new(n_threads: i32) -> Self {
+    /// `n_threads`/`n_batch` are threaded through to every `EngineConfig` this server's
+    /// dedicated engine worker loads (Loop 6: `n_threads` was previously hardcoded to
+    /// `EngineConfig::default()`, making tuning require a recompile; Loop 7: same treatment for
+    /// `n_batch`; now real startup-time values, see `main.rs`'s `--threads`/`--batch` flags).
+    pub fn new(n_threads: i32, n_batch: u32) -> Self {
         let (tx, rx) = mpsc::channel::<WorkerJob>(32);
-        std::thread::spawn(move || supervisor_loop(rx, n_threads));
+        std::thread::spawn(move || supervisor_loop(rx, n_threads, n_batch));
         Self { tx }
     }
 }
@@ -107,10 +107,10 @@ impl AppState {
 /// resolves to `Err`, which it already maps to `ApiError::Internal("engine worker thread
 /// dropped the response")` (HTTP 500) — no code change needed there, this was already
 /// correct given how `oneshot` channels signal a dropped sender.
-fn supervisor_loop(mut rx: mpsc::Receiver<WorkerJob>, n_threads: i32) {
+fn supervisor_loop(mut rx: mpsc::Receiver<WorkerJob>, n_threads: i32, n_batch: u32) {
     loop {
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            worker_loop(&mut rx, n_threads)
+            worker_loop(&mut rx, n_threads, n_batch)
         }));
         match outcome {
             Ok(()) => return, // rx closed normally (all Senders/AppState clones dropped)
@@ -140,17 +140,20 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 
 /// One worker-thread lifetime's worth of job processing, from an empty model cache until the
 /// channel closes or a panic unwinds out of here (see `supervisor_loop`).
-fn worker_loop(rx: &mut mpsc::Receiver<WorkerJob>, n_threads: i32) {
+fn worker_loop(rx: &mut mpsc::Receiver<WorkerJob>, n_threads: i32, n_batch: u32) {
     let mut engines: HashMap<String, Engine> = HashMap::new();
     while let Some(job) = rx.blocking_recv() {
-        let result = run_bench(&mut engines, job.req, n_threads);
+        let mut _s = timing::perf_span!("server::worker_loop::job");
+        _s.set("model", job.req.model.clone());
+        let result = run_bench(&mut engines, job.req, n_threads, n_batch);
         let _ = job.resp.send(result);
     }
 }
 
 impl Default for AppState {
     fn default() -> Self {
-        Self::new(EngineConfig::default().n_threads)
+        let defaults = EngineConfig::default();
+        Self::new(defaults.n_threads, defaults.n_batch)
     }
 }
 
@@ -216,7 +219,10 @@ fn run_bench(
     engines: &mut HashMap<String, Engine>,
     req: BenchRequest,
     n_threads: i32,
+    n_batch: u32,
 ) -> Result<BenchReport, ApiError> {
+    let mut _s = timing::perf_span!("server::run_bench");
+    _s.set("model", req.model.clone());
     if req.options.is_empty() {
         return Err(ApiError::InvalidOptions(
             "options must list at least one option, e.g. [\"A\",\"B\"]".to_string(),
@@ -226,11 +232,13 @@ fn run_bench(
     let mut timings = Timings::default();
 
     if !engines.contains_key(&req.model) {
+        let _s = timing::perf_span!("server::ensure_model_loaded");
         let t0 = Instant::now();
         let entry = models::find(&req.model)?;
         let model_path = models::ensure_downloaded(entry)?;
         let engine_config = EngineConfig {
             n_threads,
+            n_batch,
             ..EngineConfig::default()
         };
         let mut engine = Engine::load(&model_path, engine_config)?;

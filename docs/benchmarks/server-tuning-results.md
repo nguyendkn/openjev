@@ -506,3 +506,254 @@ default 512), `openjev-laya-serve.service` active, PID 152174 (`laya serve
 - The finer-grained `n_threads` sweep (20/24/26) for the LLM engine remains untested — unchanged
   from Loop 7, not this loop's focus (Loop 8's thread-sweep work targeted Laya, a separate
   process/flag).
+
+---
+
+# Loop 12 — Root cause of the Laya latency gap: `CMAKE_BUILD_TYPE` was empty. Fixed, deployed, measured.
+
+**This section supersedes Loop 8 §3's "remaining gap most likely lives inside `ggmlc`'s own C++
+implementation" conclusion.** That conclusion was wrong. The gap was a build misconfiguration in
+our own deployment, and it is now fixed in production.
+
+## 1. Root cause
+
+`laya serve` runs from `/tmp/ggmlc/build/examples/laya/laya`, built in Loop 5 with a plain
+`cmake -S /tmp/ggmlc -B build`. CMake's default `CMAKE_BUILD_TYPE` is the **empty string**, and an
+empty build type means CMake applies **none** of `CMAKE_CXX_FLAGS_RELEASE` / `_DEBUG` /
+`_RELWITHDEBINFO` — the compiler is invoked with no `-O` flag at all, i.e. effectively `-O0`. The
+binary built cleanly, ran correctly, and returned correct answers for 7 loops. It was just ~13x
+slower than it needed to be.
+
+Verified directly, on the real compiler command lines (not inferred from cache variables):
+
+```
+# OLD production build — /tmp/ggmlc/build/CMakeCache.txt
+CMAKE_BUILD_TYPE:STRING=                       <-- empty
+GGML_NATIVE:BOOL=ON
+# /tmp/ggmlc/build/CMakeFiles/ggml_lib.dir/flags.make
+C_FLAGS   = -std=gnu11  -fPIC -march=native
+CXX_FLAGS = -std=gnu++17 -fPIC -march=native    <-- no -O3
+
+# NEW build — /tmp/ggmlc/build-release/CMakeCache.txt
+CMAKE_BUILD_TYPE:STRING=Release
+GGML_NATIVE:BOOL=ON
+# /tmp/ggmlc/build-release/CMakeFiles/ggml_lib.dir/flags.make
+C_FLAGS   = -O3 -DNDEBUG -std=gnu11  -fPIC -march=native
+CXX_FLAGS = -O3 -DNDEBUG -std=gnu++17 -fPIC -march=native
+# /tmp/ggmlc/build-release/examples/laya/CMakeFiles/laya.dir/flags.make
+CXX_FLAGS = -O3 -DNDEBUG -std=gnu++17 -fPIE
+```
+
+**Why Loop 8's flag audit missed it:** Loop 8 §3 explicitly checked `GGML_NATIVE:BOOL=ON` and
+confirmed `-march=native` was literally on the `gcc`/`g++` command line — both true, both still
+true. It checked the flag it went looking for and read the result as "build flags ruled out",
+without reading the rest of the same `CXX_FLAGS` line, where the absence of `-O3` was visible the
+whole time. `-march=native` without `-O3` widens the *available* instruction set while telling the
+compiler not to optimize; on its own it buys very little. `CMAKE_BUILD_TYPE` was never printed by
+any prior loop's audit.
+
+Note also that `ggmlc`'s own `CMakeLists.txt` defaults `option(GGML_NATIVE ... ON)` but sets no
+default `CMAKE_BUILD_TYPE` — so nothing upstream protects against this; the caller must pass it.
+
+## 2. The fix and the deploy
+
+Rebuilt from the **pristine production source tree** `/tmp/ggmlc` (confirmed `git status
+--porcelain` empty, rev `680dd84`) into a fresh out-of-tree build dir, so the live binary was never
+written to while running:
+
+```bash
+cmake -S /tmp/ggmlc -B /tmp/ggmlc/build-release -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=ON
+cmake --build /tmp/ggmlc/build-release --target laya -j 24     # exit 0, ~85s, 0 errors
+```
+
+Binary size dropped 5,535,608 → 3,006,264 bytes (unoptimized code is larger; `-DNDEBUG` also drops
+asserts). Deliberately **not** rebuilt from Loop 11's `/tmp/ggmlc-dbg` tree — that tree carries
+Loop 11's added `dump_graph_tensors()` instrumentation in `runtime/src/executor.cpp` and is not
+what we want in production.
+
+Deploy/rollback are scripted, not hand-typed, and live next to the backup:
+
+| Path | Purpose |
+|---|---|
+| `/root/laya-binary-backups/laya-O0-preloop12-e524730c.bak` | byte-identical backup of the old binary (md5 `e524730c94fa9a99840fd5c040873352`, verified against the original after copy) |
+| `/root/laya-binary-backups/deploy-o3.sh` | stop service → `cp` new binary to `<path>.new` → atomic `mv -f` → start service → poll `/health` until 200 |
+| `/root/laya-binary-backups/rollback.sh` | same steps, sourcing the `.bak` — restores the pre-Loop-12 binary |
+
+New production binary md5: `ac88e9245cff9666e9412f7db30b4ca6` (verified identical to
+`/tmp/ggmlc/build-release/examples/laya/laya`). Service downtime for the swap: **2.2s wall**,
+`/health` → 200 immediately after.
+
+**The rollback was actually executed, not assumed.** `rollback.sh` was run against live production:
+md5 returned to `e524730c...`, and the scenario-10 probability vector returned to the old build's
+`{approve 0.8365, approve-with-conditions 0.1533, deny 0.0102}`. `deploy-o3.sh` was then re-run:
+md5 back to `ac88e924...`, probabilities back to `{0.8559, 0.1342, 0.0099}`. Both directions are
+proven working on the real service, not documented-and-hoped.
+
+## 3. Before/after — external `curl`, nothing else changed
+
+Same source commit, same Q8_0 GGUF, same `--threads 28`, same systemd unit, same box. Measured
+from a machine **outside** the server via `POST http://103.146.166.46:80/bench` (not SSH-side):
+
+| | `laya_inference_ms` (5 consecutive external calls) |
+|---|---|
+| **Before** (`CMAKE_BUILD_TYPE=""`) | 1267, 1910, 1202 |
+| **After** (`CMAKE_BUILD_TYPE=Release`) | 131, 129, 113, 158, 113 |
+
+~**10x** on single external calls, and squarely in the ~90-160ms class D_12 asked for.
+
+## 4. Correctness re-verified on the ACTUAL swapped-in binary (Task 3)
+
+All 10 project benchmark scenarios re-run directly against `POST /v1/decide`, 3 reps each, on
+three binaries: the new production one (8090, post-swap), the same `-O3` build on an isolated port
+(8091, pre-swap), and Loop 11's `-O3` dbg build (8092).
+
+| Scenario | choice (all 3 `-O3` binaries) | top prob `-O3` | top prob OLD `-O0` | `-O3` times (s) | `-O0` times (s) |
+|---|---|---|---|---|---|
+| 1_email_routing | billing | 0.973 | 0.973 | 0.102/0.100/0.100 | 1.776/1.248/1.342 |
+| 2_jailbreak_detection | benign | 0.468 | 0.468 | 0.094/0.098/0.108 | 1.372/1.314/1.306 |
+| 3_invoice_categorization | infrastructure | 0.908 | 0.908 | 0.098/0.112/0.115 | 1.271/1.215/1.212 |
+| 4_agent_tool_routing | email-send | 0.686 | 0.686 | 0.108/0.102/0.111 | 1.087/1.081/1.142 |
+| 5_incident_severity | sev1 | 0.452 | 0.452 | 0.100/0.107/0.114 | 1.128/1.201/1.139 |
+| 6_content_moderation | ban-user | 0.583 | 0.583 | 0.110/0.124/0.125 | 1.101/1.397/1.108 |
+| 7_support_sentiment_routing | billing | 0.979 | 0.979 | 0.110/0.167/0.112 | 1.111/1.152/1.087 |
+| 8_adversarial_ambiguity | billing-disputes | 0.895 | 0.895 | 0.090/0.094/0.095 | 1.059/1.127/1.180 |
+| 9_compliance_gating | no | 0.563 | 0.563 | 0.095/0.091/0.093 | 1.123/1.152/1.029 |
+| 10_loan_credit_risk | approve | **0.856** | **0.837** | 0.094/0.094/0.091 | 1.153/1.021/1.078 |
+
+**10/10 scenarios: identical `choice`. 9/10: identical top probability to 4 d.p.**
+
+**The one discrepancy, reported rather than glossed:** scenario 10 differs in the third decimal.
+Full vectors:
+
+| build | approve | approve-with-conditions | deny | confidence |
+|---|---|---|---|---|
+| NEW production `-O3` (8090/8091) | 0.8559 | 0.1342 | 0.0099 | 0.5917 |
+| Loop 11 `-O3` dbg build (8092) | 0.8559 | 0.1342 | 0.0099 | 0.5917 |
+| OLD `-O0` production | 0.8365 | 0.1533 | 0.0102 | 0.5599 |
+
+The new production binary matches **Loop 11's `-O3` build exactly, bit for bit**, and it is the
+old `-O0` build that is the outlier — which is exactly the direction D_12's validation requirement
+asked for ("results match Loop 11's `-O3` findings, not the old `-O0` production findings"). Cause
+is the expected one: `-O3` licenses different vectorization/FMA-contraction and therefore a
+different float summation order, which Q8_0 activation re-quantisation then amplifies slightly —
+the same 1-ULP-class mechanism already documented in `crates/laya-native/src/lib.rs` for
+`target-cpu=native`. It moves probabilities by <2pp on the one most-ambiguous scenario and changes
+no decision anywhere.
+
+## 5. Full harness re-run — `docs/benchmarks/laya-o3-loop12-{raw.jsonl,summary.json}`
+
+Same `scripts/bench-harness.sh` methodology as every prior loop (3 models × 10 scenarios, Laya not
+skipped, 30 real HTTP requests). `total_requests: 30`, `error_count: 0`.
+
+### `laya_inference_ms` — the field this loop targeted
+
+| Model | Loop 8 (threads=28, Q8_0, `-O0`) mean | Loop 12 (`-O3`) mean / median / max | Speedup (mean) |
+|---|---|---|---|
+| qwen3-0.6b | 1243.8 | **158.3** / 153.5 / 202 | **7.86x** |
+| minicpm5-2b | 1157.0 | **167.0** / 163.5 / 209 | **6.93x** |
+| qwen3-4b | 1206.1 | **145.6** / 141.5 / 217 | **8.28x** |
+
+Cumulative against Loop 7's pre-`--threads`-fix numbers (6543-7209ms): **~40-49x** across the two
+fixes combined.
+
+### Other fields, same run (not this loop's target, reported for completeness)
+
+| Model | `constrained_readout_ms` mean/median/max | `generation_ms` mean/median/max | `wall_ms` mean |
+|---|---|---|---|
+| qwen3-0.6b | 230.7 / 238 / 289 | 5147.3 / 5072 / 7542 | 5669.8 |
+| minicpm5-2b | 437.0 / 425 / 586 | 9184.9 / 9674.5 / 14767 | 10225.7 |
+| qwen3-4b | 496.9 / 501 / 603 | 15207.8 / 15340 / 22208 | 16013.1 |
+
+**Incidental confirmation of Loop 8's open question.** Loop 8 §2 flagged that
+`constrained_readout_ms` had jumped 2-3x (to 413.0-593.6ms) once Laya started using 28 threads, and
+hypothesised — without proof — that Laya's now-real CPU footprint was contending with the LLM
+engine. This loop's numbers support that: Laya's per-request CPU time dropped ~8x, and
+`constrained_readout_ms` fell to 230.7-496.9ms in the same run, with nothing about the LLM engine
+changed (same binary, `--threads 28`, `n_batch` 512, `target-cpu=native`). Still single-run, still
+not a controlled experiment — but the effect moved in the predicted direction when the predicted
+cause was removed, which is more than Loop 8 had. Not claimed as proven.
+
+### Where this puts us against the external anchors
+
+| Anchor | Latency | Ours now |
+|---|---|---|
+| Laya on Intel i3-12100 (4c/8t consumer, community) | 112 ms / 1 question | **145.6-167.0 ms mean, 141.5-163.5 median** |
+| Laya, undisclosed CPU (Shray15) | 360 ms | same |
+| Jev cloud API, real 3rd-party P50 | 300-1070 ms | same |
+
+Loop 8's "still 8-25x above the community CPU anchors" gap is **closed**. We are now in the same
+class as the i3-12100 anchor (~1.3-1.5x of it, on a shared box also running a 28-thread LLM engine
+and answering through an HTTP layer), and comfortably faster than the Jev cloud P50 cluster. No
+further micro-optimization was attempted — out of D_12's scope, and the remaining delta is small
+enough that it would need a controlled, repeated-run methodology to even measure honestly.
+
+## 6. What this means for `crates/laya-native` — current standing, not a verdict
+
+The honest arithmetic: Loops 9-11 measured the hand-written Rust engine at **95.1 ms** against a
+production C++ incumbent at **~1262 ms** and read it as a ~13x architectural win. Against the
+correctly-built C++ — **92.7 ms** (Loop 11's own `-O3` rebuild, independently reproduced by this
+loop's production binary and confirmed bit-identical in §4) — the Rust engine is **~3% slower**.
+Effectively parity. Essentially the entire headline speedup was the missing `-O3`, not the
+architecture.
+
+**That is a recalibration of the baseline, not a decision to stop.** Stated explicitly so the
+record can't be misread later:
+
+- `crates/laya-native` **remains an active optimization target**. Loop 13+ continues work on it —
+  reducing graph node count, tightening memory/allocation behaviour, kernel-level experiments —
+  with the explicit goal of beating the `-O3` C++ number rather than the old `-O0` phantom.
+- **All** of its env-gated debug scaffolding (`LAYA_RS_DUMP`, `LAYA_RS_FULL`, `LAYA_PERTURB`,
+  `LAYA_INJECT_HIDDEN`, and the tensor/case hooks) is **deliberately kept**, not removed. Getting
+  the graph numerically identical to `ggmlc` was hard; these are the instruments that made it
+  possible and they are the first thing the next optimization pass will reach for. A crate-status
+  note explaining this now sits at the top of `crates/laya-native/src/debug.rs` and `lib.rs`.
+- It is **not wired into `apps/server`/`apps/cli` yet**, and that is a *gating criterion, not a
+  rejection*: production stays on the HTTP-to-`laya serve` path until the native crate
+  demonstrably beats the `-O3` baseline. This loop's production fix was the cheap, low-risk,
+  immediately-available win and was taken on that basis; it does not compete with continuing the
+  Rust work.
+
+The transferable lesson, recorded in `docs/tutorial/05-benchmark-and-performance.md` and
+`06-deployment-best-practices.md` § Finding 4: **a speedup claim is a claim about two
+configurations, and the burden of proof is on both — especially the side you didn't build
+yourself. A 10x+ unexplained gap is a configuration smell before it is an algorithmic finding.**
+
+## 7. Full regression pass (Task 7)
+
+See the Loop 12 evidence file for raw output. Summary:
+
+- **CLI**, all 3 models × 3 methods (`--prompt "Which city is the capital of France?" --options
+  "London,Paris"`, Laya not skipped): `readout.best_option=Paris`, `generate.valid=true`
+  (`{"answer":"Paris"}`), `laya.best_option=Paris` — 3/3 models.
+- **External `curl`** to `103.146.166.46:80/bench` (from outside the box), all 3 models: same
+  three results, `laya_inference_ms` in the 113-158ms band. External `/health` → 200.
+- **G13 fault injection** (6th consecutive loop, own sentinel `__QA_LOOP12_FAULT_INJECT__`):
+  trigger → HTTP 500 `{"error":"engine worker thread dropped the response"}`, `/health` → 200
+  immediately after, next `/bench` → 200 with a fresh `model_load_ms` and the correct answer;
+  journal shows the real panic + respawn line. `app.rs` reverted, md5 exact match, sentinel grep
+  count 0.
+- **Laya-outage graceful degrade**: `systemctl stop openjev-laya-serve.service` → `/bench` → HTTP
+  200 with `laya: null` and a fast-fail `laya_inference_ms`, real degrade log line; restart →
+  next `/bench` → `laya.best_option=Paris`, no `openjev-server` restart needed.
+- **G17** (external `:8090` blocked) and **G18** (firewall systemd unit persists) both re-verified
+  after the binary swap — unaffected, as expected since neither depends on the binary.
+- `cargo build --workspace` (debug + release) and `cargo test --workspace` re-run clean.
+
+## 8. Remaining gaps after Loop 12
+
+- **`crates/laya-native` has not yet beaten the `-O3` C++ baseline** (95.1ms vs 92.7ms, ~3%
+  behind). Open and actively worked, carried to Loop 13+.
+- **`act_head` in `crates/laya-native` remains unimplemented** — unchanged, not in this loop's
+  scope.
+- **The `constrained_readout_ms` / Laya-contention interaction (§5) is corroborated, not proven.**
+  A controlled multi-run experiment (readout latency with vs without a concurrently loaded Laya)
+  would settle it; still outside "not an open-ended search".
+- **The harness remains single-run, sequential, no repeats** — the same noise caveat every loop
+  since Loop 6 has carried. Fine for the 8x effect measured here; not fine for chasing sub-10%
+  deltas, which is exactly why no further micro-optimization was attempted.
+- **No other CMake-built dependency has been audited for the same class of bug.** This loop fixed
+  `ggmlc` specifically. `llama-cpp-sys-2`'s vendored build was verified optimized back in Loop 7
+  (`-O3` present via Cargo's release profile), but that is the only other one checked.
+- G10 / G12 / G14 / G16 / G2 / G11 — unchanged, carried from prior loops.
+- The finer-grained LLM-engine `n_threads` sweep (20/24/26) remains untested, unchanged since
+  Loop 7.

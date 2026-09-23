@@ -85,6 +85,7 @@ impl Engine {
     /// Loads a GGUF model from `model_path` and creates a persistent CPU-only inference
     /// context per `config`.
     pub fn load(model_path: &Path, config: EngineConfig) -> Result<Self, EngineError> {
+        let _s = timing::perf_span!("engine::load");
         let backend = shared_backend()?;
 
         // CPU-only: n_gpu_layers = 0 explicitly (llama-cpp-2's own default is -1 = "auto
@@ -127,6 +128,7 @@ impl Engine {
 
     /// Tokenizes `text`, adding a BOS token. Used for full prompts fed to `decode_prompt`.
     pub fn tokenize(&self, text: &str) -> Result<Vec<LlamaToken>, EngineError> {
+        let _s = timing::perf_span!("engine::tokenize");
         self.model
             .str_to_token(text, AddBos::Always)
             .map_err(|e| EngineError::Tokenize(e.to_string()))
@@ -136,6 +138,7 @@ impl Engine {
     /// (e.g. `"A"`) to its raw token id for constrained readout, where BOS would just be
     /// leading noise.
     pub fn tokenize_no_bos(&self, text: &str) -> Result<Vec<LlamaToken>, EngineError> {
+        let _s = timing::perf_span!("engine::tokenize_no_bos");
         self.model
             .str_to_token(text, AddBos::Never)
             .map_err(|e| EngineError::Tokenize(e.to_string()))
@@ -145,6 +148,7 @@ impl Engine {
     /// `<|im_start|>role\n...<|im_end|>`) to a single-turn user message, with a hand-built
     /// ChatML fallback if the GGUF has no chat template metadata.
     pub fn apply_chat_template(&self, user_content: &str) -> Result<String, EngineError> {
+        let _s = timing::perf_span!("engine::apply_chat_template");
         match self.model.chat_template(None) {
             Ok(tmpl) => {
                 let msg = LlamaChatMessage::new("user".to_string(), user_content.to_string())
@@ -164,6 +168,8 @@ impl Engine {
     /// requested from `llama_decode`, matching Decisions Locked's "restrict before softmax"
     /// intent one level down (full-vocab logits here; callers do the restriction).
     pub fn decode_prompt(&mut self, tokens: &[LlamaToken]) -> Result<Vec<f32>, EngineError> {
+        let mut _s = timing::perf_span!("engine::decode_prompt");
+        _s.set("n_tokens", tokens.len().to_string());
         if tokens.is_empty() {
             return Err(EngineError::BatchAdd("empty token sequence".to_string()));
         }
@@ -183,6 +189,7 @@ impl Engine {
     /// Decodes a single already-generated token (used in the greedy generation loop) at
     /// `pos`, returning the next-token logits.
     pub fn decode_next(&mut self, token: LlamaToken, pos: i32) -> Result<Vec<f32>, EngineError> {
+        let _s = timing::perf_span!("engine::decode_next");
         let mut batch = LlamaBatch::new(1, 1);
         batch
             .add(token, pos, &[0], true)
@@ -231,6 +238,7 @@ impl Engine {
     /// Greedy-samples the next token directly from the context's last-decoded logits using
     /// `llama-cpp-2`'s own `LlamaSampler::greedy()`.
     pub fn sample_greedy(&self) -> LlamaToken {
+        let _s = timing::perf_span!("engine::sample_greedy");
         let mut sampler = LlamaSampler::greedy();
         sampler.sample(&self.ctx, 0)
     }
@@ -252,6 +260,7 @@ impl Engine {
     /// runs sharing this `Engine` (e.g. between `run_readout` and `run_generate`) so the
     /// second run's positions/attention are not contaminated by the first run's state.
     pub fn reset_context(&mut self) {
+        let _s = timing::perf_span!("engine::reset_context");
         self.ctx.clear_kv_cache();
     }
 }

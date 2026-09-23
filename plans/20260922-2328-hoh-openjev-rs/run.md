@@ -244,6 +244,67 @@ must either close it with a proven root cause, or if it's provably bounded float
 (demonstrated across a broader test set, not just one example), document that bound explicitly
 before Loop 12 considers cutover.
 
+**Loop 11 (delivered): gap closed, G21/G22 fixed — AND a finding that reframes the whole
+optimization narrative.** Root causes found via real layer-by-layer diffing against an
+out-of-tree `ggmlc` debug build (`/tmp/ggmlc-dbg`, never touching the production tree):
+(1) RoPE was recomputed instead of using the GGUF's baked cos/sin tables — fixed; (2) missing
+`-C target-cpu=native` caused a 1-ULP norm difference that chaotically amplifies through 28
+layers of Q8_0 requantization (fascinating numerically, confirmed via perturbation testing);
+(3) a REAL logic bug — our temperature clamp `[0.5, 5.0]` was wrong, the reference only clamps
+to `max(t, 1e-3)`, so the `choice:11+` bucket's fitted temperature (0.1006) was being
+incorrectly clamped up to 0.5, silently corrupting confidence for any >10-option question. With
+all 3 fixed, native Rust matches the reference to <1e-4 on the exact case, and matches a
+properly-optimized rebuild of `ggmlc` (`-O3`) across 7 diverse benchmark scenarios (7/7 correct
+choice, most within tiny epsilon). G22 (resource leak) fixed with proper `Drop` impls, verified
+via flat `VmHWM` memory across repeated graph builds.
+
+**THE PIVOTAL FINDING**: comparing against a *properly-optimized* rebuild of the exact same
+`ggmlc` source (`-O3`, `/tmp/ggmlc-dbg/build-dbg`) instead of production's actual build reveals
+production's `laya serve` has been running with `CMAKE_BUILD_TYPE=""` (effectively `-O0`,
+**unoptimized**) since it was first deployed in Loop 5 — nobody had checked this. The `-O3`
+rebuild of the SAME unmodified `ggmlc` source achieves ~92.7ms, matching `crates/laya-native`'s
+own 95.1ms almost exactly (native Rust is actually ~3% SLOWER). **Nearly the entire "10-13x
+speedup" narrative from Loops 9-11 was a production build misconfiguration, not an inherent
+advantage of hand-rolled code over `ggmlc`'s generic compiler.** Independently re-verified by
+Runtime: confirmed `CMAKE_BUILD_TYPE:STRING=` is empty in production's actual `CMakeCache.txt`,
+and confirmed current production latency is still ~1.4s.
+
+**Runtime decision for Loop 12**: fix the REAL root cause first — rebuild+deploy production
+`laya`/`ggmlc` with proper `-O3`/`-DGGML_NATIVE=ON` flags, immediately, since it's a free,
+low-risk win regardless of anything else (same well-tested C++ code, just built correctly).
+
+**Loop 12 (delivered): production fixed, ~7-8x faster, tested rollback, DoD massively
+exceeded.** Confirmed at the compiler-invocation level (not just cache variables):
+`flags.make` showed `-march=native` was already there (why Loop 8's audit missed it) but NO
+`-O` flag at all. Rebuilt out-of-tree from the pristine production source
+(`-DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=ON`), deployed via a scripted backup+atomic-swap
+(`deploy-o3.sh`/`rollback.sh`), **rollback drilled for real against live production** (not just
+documented) — reverted and re-deployed, verified both directions by md5 and by the actual
+answer changing back and forth. Result, independently re-verified by Runtime via external curl:
+**~103-158ms per Laya inference** (was ~1200-1900ms) = 7-8x this fix alone, **~40-49x
+cumulative** vs the original Loop 5-7 baseline (~6500-8500ms) once threads+quant+build-flag
+fixes are all combined. This is now FASTER than Jev's own real-world benchmarked P50
+(300ms-1.07s) and in the same class as the best community CPU anchor (112ms/i3-12100). 10/10
+scenario choices match Loop 11's `-O3` validation exactly; full regression (G13, Laya-outage,
+G17, G18, 3 models × 3 methods) all re-verified clean. Per explicit user correction mid-loop,
+`crates/laya-native` is NOT framed as abandoned anywhere in the docs — it's an active baseline
+(95.1ms, ~3% behind the now-fixed 92.7ms C++) for Loop 13+ to keep pushing past.
+
+**User directive (new)**: investigate underutilized RAM/SSD — currently a single request
+saturates ~28/32 CPU cores via one serialized worker thread while 62GB RAM sits mostly idle.
+Research spawned in parallel (`researcher-11-resource-utilization.md`, in progress) covering:
+multi-worker pool (trade single-request latency for concurrent throughput), `mmap`-based model
+loading (share read-only pages across workers via OS page cache instead of duplicating RAM),
+request batching, and whether `n_threads=28` (latency-optimal for Loop 6's single-request
+tuning) is still optimal under concurrent multi-request load.
+
+**User directive (overrides any "stop investing in Rust" framing)**: keep developing and
+optimizing `crates/laya-native`. The 95.1ms vs 92.7ms (~3% slower than fixed C++) result is a
+CURRENT BASELINE to beat, not a conclusion to stop on. Loop 13+ continues pushing the native
+Rust engine (fewer graph nodes, better memory layout, further ggml-level tuning) with the goal
+of genuinely exceeding the corrected C++ baseline, before any decision about production
+wiring is revisited. `crates/laya-native` remains an active target, not a shelved reference.
+
 **Stop-gate note**: HoH's literal stop condition (`status: passed AND unresolved_gaps: [] AND
 regressions: []`) is not strictly met because the 4 tracked gaps above remain open — but none
 of them are part of the user's stated Definition of Done, and the DoD itself is fully met with

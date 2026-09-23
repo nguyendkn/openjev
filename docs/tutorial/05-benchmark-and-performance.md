@@ -63,9 +63,47 @@ The card notes: **"~6–7x faster than Jev"** (comparing T4 Laya vs. Jev's repor
 | **Intel i3-12100** (4c/8t) | 4 questions | **532 ms** | Same repo |
 | **Intel i3-12100** (4c/8t) | 12 questions | **2,408 ms** | Same repo |
 | **Undisclosed CPU** | 1 question (Laya) | **360 ms** | Shray15/laya-vs-llm-benchmark |
-| **Ubuntu 32-core Xeon** (post-tuning, Q8_0, threads=28) | 1 question (HTTP `/v1/decide`) | **1.2–1.4s** | openjev-rs Loop 8 |
+| **Ubuntu 32-core Xeon** (Q8_0, threads=28, **unoptimized `-O0` build**) | 1 question (HTTP `/v1/decide`) | 1.2–1.4s | openjev-rs Loop 8 — *superseded, see below* |
+| **Ubuntu 32-core Xeon** (Q8_0, threads=28, **`-O3 -march=native` build**) | 1 question (HTTP `/v1/decide`) | **90–160 ms** | openjev-rs Loop 12 |
 
-**Caveat**: The i3-12100 (4-core consumer) beats the 32-core Xeon by **~11x** on a per-core basis. This gap is **not tuning** (the Xeon had native flags, thread count tuning, quant choice all optimized; see 06-deployment-best-practices.md). The gap likely lives in ggmlc's own C++ implementation efficiency for this specific op set.
+### The 11x "Xeon Loses to a Consumer i3" Anomaly — Resolved (Loop 11–12)
+
+Loops 8–10 recorded an unexplained result: a 32-core Xeon Gold 5320 was ~11x *slower* per question
+than a 4-core consumer i3-12100. Thread count, quantization format and `GGML_NATIVE`/`-march=native`
+had all been checked and ruled out, so the gap was written down as "probably ggmlc's C++
+implementation efficiency."
+
+That was wrong, and the real cause was simpler: the `ggmlc` build on the Xeon had been configured
+with **no `-DCMAKE_BUILD_TYPE`**, whose empty default means CMake adds **no optimization flags at
+all** — an effectively `-O0` binary. `-march=native` was genuinely present (which is why the
+earlier flag audit passed), but on its own it only widens the *available* instruction set; without
+`-O3` the compiler barely uses it.
+
+Rebuilding the identical source with `-DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=ON` and swapping the
+binary into production:
+
+| Metric (external `curl`, nothing else changed) | Before | After |
+|---|---|---|
+| `laya_inference_ms` | 1202 / 1267 / 1910 ms | **113 / 113 / 129 / 131 / 158 ms** |
+| 10-scenario `/v1/decide` direct | 1.02–1.78 s | **0.090–0.167 s** |
+
+That lands the Xeon at **~90–160ms**, i.e. the **same class as the i3-12100's 112ms** community
+anchor — and inside this chapter's own "50–150ms P50" recommended target below. The anomaly was a
+build-configuration bug, not an upstream-efficiency finding. See
+06-deployment-best-practices.md § Finding 4 for the full diagnosis and the general lesson.
+
+### Side Effect: This Also Recalibrated Our Own Rust Rewrite
+
+Loops 9–11 built `crates/laya-native`, a from-scratch Rust + raw-ggml reimplementation of the Laya
+model, and measured it at **95.1 ms** against the then-production C++ at ~1262 ms — apparently a
+13x architectural win. Against the *correctly built* C++ (92.7 ms), it is **~3% slower — parity,
+not a win**.
+
+This is reported as the current standing, not a conclusion: the native Rust path is still being
+optimized (fewer graph nodes, tighter memory behaviour, kernel-level experiments) with the explicit
+goal of beating the `-O3` C++ baseline, and it is not wired into production until it does. The
+durable lesson is about measurement, not about Rust vs C++: **an impressive-looking speedup is a
+claim about two configurations, and you own the burden of proof on both of them.**
 
 ### CPU Quant Comparison (Loop 8 of openjev-rs)
 
@@ -130,21 +168,30 @@ Real benchmarks from a 32-core Xeon Ubuntu server, after full tuning (Loop 7–8
 
 **Note**: Generation is **not a Jev equivalent**; it's an intentionally slower validation arm (see 03-real-world-usecases.md § Honest Reframe). Architecturally different from Jev's single-pass scoring.
 
-#### Laya Method (Separate HTTP Service, After Thread Fix)
+#### Laya Method (Separate HTTP Service, After Thread Fix + `-O3` Build Fix)
 
-| Model | Mean | Median | Max |
-|-------|------|--------|-----|
-| Qwen3-0.6B | **1.2s** | 1.3s | 1.5s |
-| MiniCPM5-2B | **1.2s** | 1.2s | 1.4s |
-| Qwen3-4B | **1.2s** | 1.2s | 1.4s |
+Current production (Loop 12, `ggmlc` built `-O3 -march=native`, 30 requests, `error_count: 0`):
 
-**Note**: Same across models (Laya's latency doesn't scale with LLM size — it's an encoder, not running the 3 different LLM models).
+| Model | Mean | Median | Max | Loop 8 mean (`-O0` build) | Speedup |
+|-------|------|--------|-----|---------------------------|---------|
+| Qwen3-0.6B | **158 ms** | 154 ms | 202 ms | 1244 ms | 7.9x |
+| MiniCPM5-2B | **167 ms** | 164 ms | 209 ms | 1157 ms | 6.9x |
+| Qwen3-4B | **146 ms** | 142 ms | 217 ms | 1206 ms | 8.3x |
+
+**Note**: Roughly constant across models, as expected — Laya's latency doesn't scale with LLM size; it's a separate encoder, not running the 3 different LLM models.
+
+**Note on the two fixes**: Loop 8 fixed `--threads 4 → 28` (~5.8x). Loop 12 fixed
+`CMAKE_BUILD_TYPE="" → Release` (~7-8x). Combined, vs the Loop 7 baseline of 6543–7209 ms:
+**~40–49x**. Neither fix was an optimization; both were *misconfigurations*. That ratio — two
+config bugs worth 40x, versus every genuine tuning lever (thread sweep, quant choice, `n_batch`)
+worth 10–25% combined — is the single most useful number in this chapter.
 
 ### Raw Data
 
 Full per-request timing data:
 - `docs/benchmarks/native-summary.json` — Loop 7 (native build, all tuning applied, baseline).
 - `docs/benchmarks/laya-threads28-summary.json` — Loop 8 (Laya fixed, Q8_0 quant, threads=28 for both).
+- `docs/benchmarks/laya-o3-loop12-summary.json` — Loop 12 (`ggmlc` rebuilt `-O3 -march=native`, **current production**).
 
 Each file includes: `model_load_ms`, `warmup_ms`, `tokenize_ms`, `constrained_readout_ms`, `generation_ms`, `laya_inference_ms`, `laya_model_load_ms`, `total_requests`, `error_count`.
 
