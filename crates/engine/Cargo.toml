@@ -7,3 +7,6 @@ edition = "2021"
 llama-cpp-2 = "0.1"
 models = { path = "../models" }
 timing = { path = "../timing" }
+
+[features]
+cuda = ["llama-cpp-2/cuda"]

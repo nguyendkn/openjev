@@ -57,10 +57,12 @@ fn shared_backend() -> Result<&'static LlamaBackend, EngineError> {
     Ok(BACKEND.get_or_init(|| backend))
 }
 
-/// Configuration for [`Engine::load`]. CPU-only: `llama-cpp-2` is used with its default
-/// feature set (no `cuda`/`vulkan`/`rocm`/`opencl` cargo features enabled — see
-/// `crates/engine/Cargo.toml`), and `n_gpu_layers` is pinned to `0` explicitly below so no
-/// layers are offloaded even if a GPU backend happened to be compiled in.
+/// Configuration for [`Engine::load`]. GPU offload (`n_gpu_layers`) only has an effect when
+/// this crate is built with the `cuda` cargo feature (`crates/engine/Cargo.toml`'s
+/// `[features] cuda = ["llama-cpp-2/cuda"]`, forwarding to `llama-cpp-2/cuda`) — the GPU
+/// backend is selected at *compile* time, not runtime, so a default build (no `--features
+/// cuda`, still the only variant used in production today) links no GPU offload code path at
+/// all regardless of this field's value.
 #[derive(Debug, Clone, Copy)]
 pub struct EngineConfig {
     /// Threads used for both single-token and batch decode. Default leaves headroom on a
@@ -70,6 +72,25 @@ pub struct EngineConfig {
     pub n_ctx: u32,
     /// Max tokens processed per `decode()` call.
     pub n_batch: u32,
+    /// Number of model layers to offload to the GPU
+    /// (`llama-cpp-2 = "0.1.157"`'s `LlamaModelParams::with_n_gpu_layers`). `0` (the default)
+    /// offloads nothing, i.e. identical to this crate's pre-GPU-offload CPU-only behavior,
+    /// including on a `cuda`-feature build with this field left at its default.
+    ///
+    /// A negative value means "all layers" at the underlying llama.cpp C level — verified
+    /// directly against the vendored source (not the Rust wrapper's docs, which don't state
+    /// this): `llama.h:321`'s `// number of layers to store in VRAM, a negative value means
+    /// all layers`, and `llama-model.cpp:1926`'s
+    /// `params.n_gpu_layers >= 0 ? params.n_gpu_layers : hparams.n_layer_all + 1`. However,
+    /// `llama-cpp-2`'s own `LlamaModelParams::with_n_gpu_layers` takes `u32`, not `i32`, so
+    /// [`Engine::load`] casts this field to `u32` before calling it; a negative value here
+    /// wraps to a huge `u32`, which `with_n_gpu_layers`'s internal `i32::try_from` then clamps
+    /// to `i32::MAX` (still `>= 0`, so it takes the *other* branch of the C check above) — but
+    /// since `i32::MAX` vastly exceeds any real model's layer count, llama.cpp's own per-layer
+    /// clamp (`min(n_gpu_layers, n_layer_all)`, `llama-model.cpp:1834`) still offloads every
+    /// layer, so the practical effect ("offload everything") matches the C-level "negative
+    /// means all layers" semantics either way.
+    pub n_gpu_layers: i32,
 }
 
 impl Default for EngineConfig {
@@ -78,6 +99,7 @@ impl Default for EngineConfig {
             n_threads: 28,
             n_ctx: 4096,
             n_batch: 512,
+            n_gpu_layers: 0,
         }
     }
 }
@@ -105,10 +127,12 @@ impl Engine {
         let _s = timing::perf_span!("engine::load");
         let backend = shared_backend()?;
 
-        // CPU-only: n_gpu_layers = 0 explicitly (llama-cpp-2's own default is -1 = "auto
-        // offload if a GPU backend is compiled in"; we never build with one, but pin this
-        // anyway so intent is explicit and future Cargo.toml changes can't silently offload).
-        let model_params = LlamaModelParams::default().with_n_gpu_layers(0);
+        // `config.n_gpu_layers` (0 by default, unchanged CPU-only behavior). Only has any
+        // effect on a `cuda`-feature build (see `EngineConfig::n_gpu_layers`'s doc); cast to
+        // `u32` because `with_n_gpu_layers` takes that, not `i32` — see the same doc for why a
+        // negative value still offloads every layer despite the cast.
+        let model_params =
+            LlamaModelParams::default().with_n_gpu_layers(config.n_gpu_layers as u32);
         let model = LlamaModel::load_from_file(backend, model_path, &model_params)
             .map_err(|e| EngineError::ModelLoad(e.to_string()))?;
         let model = Box::new(model);

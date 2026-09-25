@@ -36,6 +36,16 @@ struct Cli {
     /// recompiling a different default).
     #[arg(long)]
     batch: Option<u32>,
+
+    /// Number of model layers to offload to the GPU, passed through to every `EngineConfig`
+    /// this server's workers load. Only has an effect on a `cuda`-feature build (`cargo build
+    /// --features engine/cuda`) — a default (CPU-only) build links no GPU offload code path,
+    /// so this is accepted but ignored there. Defaults to
+    /// `engine::EngineConfig::default().n_gpu_layers` (`0`, no offload) when omitted, same
+    /// pattern as `--threads`/`--batch`. See `EngineConfig::n_gpu_layers`'s doc for what a
+    /// negative value means.
+    #[arg(long)]
+    gpu_layers: Option<i32>,
 }
 
 #[tokio::main]
@@ -48,7 +58,10 @@ async fn main() {
     let n_batch = cli
         .batch
         .unwrap_or_else(|| engine::EngineConfig::default().n_batch);
-    let state = app::AppState::new(n_workers, n_threads, n_batch);
+    let n_gpu_layers = cli
+        .gpu_layers
+        .unwrap_or_else(|| engine::EngineConfig::default().n_gpu_layers);
+    let state = app::AppState::new(n_workers, n_threads, n_batch, n_gpu_layers);
     let router = app::router(state);
 
     let addr = format!("0.0.0.0:{}", cli.port);

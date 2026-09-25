@@ -72,8 +72,8 @@ pub struct Pool {
 
 impl Pool {
     /// Spawns `n_workers` worker threads, each with its own supervisor, model cache and
-    /// `EngineConfig { n_threads, n_batch }`.
-    pub fn new(n_workers: usize, n_threads: i32, n_batch: u32) -> Self {
+    /// `EngineConfig { n_threads, n_batch, n_gpu_layers }`.
+    pub fn new(n_workers: usize, n_threads: i32, n_batch: u32, n_gpu_layers: i32) -> Self {
         let n_workers = n_workers.max(1);
         let mut workers = Vec::with_capacity(n_workers);
         for worker_id in 0..n_workers {
@@ -84,7 +84,9 @@ impl Pool {
             let cached_worker = Arc::clone(&cached);
             std::thread::Builder::new()
                 .name(format!("engine-worker-{worker_id}"))
-                .spawn(move || supervisor_loop(worker_id, rx, cached_worker, n_threads, n_batch))
+                .spawn(move || {
+                    supervisor_loop(worker_id, rx, cached_worker, n_threads, n_batch, n_gpu_layers)
+                })
                 .expect("spawn engine worker thread");
             workers.push(WorkerHandle {
                 tx,
@@ -184,10 +186,11 @@ fn supervisor_loop(
     cached: Arc<Mutex<HashSet<String>>>,
     n_threads: i32,
     n_batch: u32,
+    n_gpu_layers: i32,
 ) {
     loop {
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            worker_loop(worker_id, &mut rx, &cached, n_threads, n_batch)
+            worker_loop(worker_id, &mut rx, &cached, n_threads, n_batch, n_gpu_layers)
         }));
         match outcome {
             Ok(()) => return, // rx closed normally (all Senders/AppState clones dropped)
@@ -225,6 +228,7 @@ fn worker_loop(
     cached: &Arc<Mutex<HashSet<String>>>,
     n_threads: i32,
     n_batch: u32,
+    n_gpu_layers: i32,
 ) {
     let mut engines: HashMap<String, Engine> = HashMap::new();
     while let Some(job) = rx.blocking_recv() {
@@ -232,7 +236,7 @@ fn worker_loop(
         _s.set("model", job.req.model.clone());
         _s.set("worker", worker_id.to_string());
         let model = job.req.model.clone();
-        let result = run_bench(&mut engines, job.req, n_threads, n_batch);
+        let result = run_bench(&mut engines, job.req, n_threads, n_batch, n_gpu_layers);
         // Publish affinity only on success: on failure the model may never have made it into
         // `engines`, and over-claiming would send future requests to a worker that would then
         // pay the load cost anyway. Under-claiming costs at most one extra load.

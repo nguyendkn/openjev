@@ -148,12 +148,14 @@ pub struct AppState {
 
 impl AppState {
     /// `n_workers` engine-worker threads, each with its own model cache and its own
-    /// `EngineConfig { n_threads, n_batch }` (so total CPU demand is `n_workers * n_threads`
-    /// — keep that at/below the core count). `n_threads`/`n_batch` are startup-time values
-    /// (Loop 6/7: `--threads`/`--batch`), `n_workers` is Loop 14's `--workers`.
-    pub fn new(n_workers: usize, n_threads: i32, n_batch: u32) -> Self {
+    /// `EngineConfig { n_threads, n_batch, n_gpu_layers }` (so total CPU demand is
+    /// `n_workers * n_threads` — keep that at/below the core count). `n_threads`/`n_batch`/
+    /// `n_gpu_layers` are startup-time values (Loop 6/7: `--threads`/`--batch`; `--gpu-layers`
+    /// for GPU offload, only has an effect on a `cuda`-feature build), `n_workers` is Loop
+    /// 14's `--workers`.
+    pub fn new(n_workers: usize, n_threads: i32, n_batch: u32, n_gpu_layers: i32) -> Self {
         Self {
-            pool: Arc::new(Pool::new(n_workers, n_threads, n_batch)),
+            pool: Arc::new(Pool::new(n_workers, n_threads, n_batch, n_gpu_layers)),
         }
     }
 }
@@ -165,6 +167,7 @@ impl Default for AppState {
             crate::pool::DEFAULT_WORKERS,
             defaults.n_threads,
             defaults.n_batch,
+            defaults.n_gpu_layers,
         )
     }
 }
@@ -252,6 +255,7 @@ pub(crate) fn run_bench(
     req: BenchRequest,
     n_threads: i32,
     n_batch: u32,
+    n_gpu_layers: i32,
 ) -> Result<BenchReport, ApiError> {
     let mut _s = timing::perf_span!("server::run_bench");
     _s.set("model", req.model.clone());
@@ -304,6 +308,7 @@ pub(crate) fn run_bench(
             let engine_config = EngineConfig {
                 n_threads,
                 n_batch,
+                n_gpu_layers,
                 ..EngineConfig::default()
             };
             let mut engine = Engine::load(&model_path, engine_config)?;
